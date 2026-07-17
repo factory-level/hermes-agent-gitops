@@ -76,7 +76,6 @@ Update semantics:
 from __future__ import annotations
 
 import logging
-import os
 import re
 import shutil
 import subprocess
@@ -87,6 +86,7 @@ from pathlib import Path
 from typing import Any, ClassVar, Dict, FrozenSet, List, Optional, Tuple
 
 from agent.skill_utils import is_excluded_skill_path
+from utils import env_var_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -795,13 +795,10 @@ def _fire_profile_lifecycle_hook(hook_name: str, *, strict: bool, **fields: Any)
     if not strict:
         return
 
-    if (
-        os.environ.get("HERMESVISOR_REQUIRE_EMITTER") == "1"
-        and not results
-        and not has_hook(hook_name)
-    ):
+    if env_var_enabled("HERMESVISOR_REQUIRE_EMITTER") and not has_hook(hook_name):
         raise ProfileHookError(
-            f"HERMESVISOR_REQUIRE_EMITTER=1 but no plugin is subscribed to {hook_name}"
+            f"Profile was installed, but HERMESVISOR_REQUIRE_EMITTER is set and "
+            f"no plugin is subscribed to {hook_name}."
         )
 
     fatal = [r for r in results if isinstance(r, dict) and r.get("fatal") and r.get("error")]
@@ -876,16 +873,22 @@ def install_distribution(
             return plan
     except (DistributionError, ValueError) as e:
         if not isinstance(e, ProfileHookError):
+            if plan is not None:
+                fail_source_url = _fragment_free_source_url(plan.provenance, plan.ref)
+                fail_ref = plan.ref
+            else:
+                # Staging failed before plan_install() returned — split any
+                # trailing #<ref> off the raw source ourselves so the payload
+                # matches the success-path contract (fragment-free source_url,
+                # populated ref) instead of dumping the raw #ref-bearing
+                # string into source_url with an empty ref.
+                fail_source_url, fail_ref = _split_source_ref(source)
             _fire_profile_lifecycle_hook(
                 "profile_install_failed",
                 strict=False,
                 name=plan.manifest.name if plan is not None else "",
-                source_url=(
-                    _fragment_free_source_url(plan.provenance, plan.ref)
-                    if plan is not None
-                    else source
-                ),
-                ref=plan.ref if plan is not None else "",
+                source_url=fail_source_url,
+                ref=fail_ref,
                 error=str(e),
                 event="install_failed",
             )
@@ -971,16 +974,20 @@ def update_distribution(
             return plan
     except (DistributionError, ValueError) as e:
         if not isinstance(e, ProfileHookError):
+            if plan is not None:
+                fail_source_url = _fragment_free_source_url(plan.provenance, plan.ref)
+                fail_ref = plan.ref
+            else:
+                # Re-staging failed before plan_install() returned — split
+                # any trailing #<ref> off the recorded source ourselves, same
+                # rationale as the install_distribution() failure path above.
+                fail_source_url, fail_ref = _split_source_ref(existing_manifest.source)
             _fire_profile_lifecycle_hook(
                 "profile_install_failed",
                 strict=False,
                 name=plan.manifest.name if plan is not None else canon,
-                source_url=(
-                    _fragment_free_source_url(plan.provenance, plan.ref)
-                    if plan is not None
-                    else existing_manifest.source
-                ),
-                ref=plan.ref if plan is not None else "",
+                source_url=fail_source_url,
+                ref=fail_ref,
                 error=str(e),
                 event="update_failed",
             )

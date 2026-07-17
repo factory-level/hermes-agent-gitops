@@ -222,6 +222,71 @@ def test_failed_install_fires_failed_hook_only(profile_env, hook_registry):
     assert kw["event"] == "install_failed"
 
 
+def test_failed_install_with_ref_pin_splits_source_and_ref_in_failed_payload(
+    profile_env, hook_registry, tmp_path
+):
+    """A ``url#ref`` source that fails during staging (before ``plan_install``
+    returns, so ``plan`` is still ``None`` in the failure handler) must still
+    produce a fragment-free ``source_url`` + populated ``ref`` in the
+    ``profile_install_failed`` payload — the same shape the success payload
+    uses (see ``test_install_fires_profile_install_with_full_payload``),
+    rather than dumping the raw ``#ref``-bearing string into ``source_url``
+    with an empty ``ref``.
+
+    The bogus source is a local path ending in ``.git`` so ``_git_clone``
+    fails immediately (no such repository) without touching the network.
+    """
+    events = []
+    _capture(hook_registry, "profile_install_failed", events)
+
+    bogus_repo = tmp_path / "does_not_exist.git"
+    source = f"{bogus_repo}#v1"
+
+    with pytest.raises(Exception):
+        install_distribution(source)
+
+    failed = [e for e in events if e[0] == "profile_install_failed"]
+    assert len(failed) == 1
+    kw = failed[0][1]
+    assert kw["source_url"] == str(bogus_repo)
+    assert "#" not in kw["source_url"]
+    assert kw["ref"] == "v1"
+
+
+def test_failed_update_with_ref_pin_splits_source_and_ref_in_failed_payload(
+    profile_env, hook_registry, tmp_path
+):
+    """Same as the install-side test above, for the ``update_distribution``
+    failure path — the recorded ``existing_manifest.source`` may itself
+    carry a ``#<ref>`` pin, and re-staging can fail before ``plan_install``
+    returns (``plan`` stays ``None``).
+    """
+    staged = _make_staging_dir(profile_env, "updref", version="1.0.0")
+    install_distribution(str(staged))
+
+    from hermes_cli.profiles import get_profile_dir
+
+    target = get_profile_dir("updref")
+    manifest = read_manifest(target)
+    bogus_repo = profile_env / "does_not_exist.git"
+    manifest.source = f"{bogus_repo}#v2"
+    write_manifest(target, manifest)
+
+    events = []
+    _capture(hook_registry, "profile_install_failed", events)
+
+    with pytest.raises(Exception):
+        update_distribution("updref")
+
+    failed = [e for e in events if e[0] == "profile_install_failed"]
+    assert len(failed) == 1
+    kw = failed[0][1]
+    assert kw["source_url"] == str(bogus_repo)
+    assert "#" not in kw["source_url"]
+    assert kw["ref"] == "v2"
+    assert kw["event"] == "update_failed"
+
+
 def test_failed_install_from_reserved_name_fires_failed_hook(profile_env, hook_registry):
     """``plan_install`` raises a bare ``ValueError`` for reserved profile
     names (e.g. 'test') via ``validate_profile_name`` — not a
@@ -362,6 +427,29 @@ def test_require_emitter_env_var_with_no_subscribers_raises(
 
 
 def test_no_env_var_and_no_subscribers_is_vanilla_success(profile_env, hook_registry):
+    staged = _make_staging_dir(profile_env, "src")
+
+    plan = install_distribution(str(staged))  # must not raise
+
+    assert plan.target_dir.is_dir()
+
+
+def test_require_emitter_with_subscriber_returning_none_succeeds(
+    profile_env, hook_registry, monkeypatch
+):
+    """A registered subscriber that returns ``None`` (a normal observer —
+    most plugin callbacks don't return anything) must satisfy the
+    ``HERMESVISOR_REQUIRE_EMITTER`` gate. The guard checks ``has_hook()``
+    (a callback is registered) rather than whether ``invoke_hook()``
+    collected a non-``None`` return value — pins that the gate can't be
+    fooled into thinking a well-behaved plugin isn't there.
+    """
+    monkeypatch.setenv("HERMESVISOR_REQUIRE_EMITTER", "1")
+
+    def _observer(**kw):
+        return None
+
+    hook_registry._hooks.setdefault("profile_install", []).append(_observer)
     staged = _make_staging_dir(profile_env, "src")
 
     plan = install_distribution(str(staged))  # must not raise
