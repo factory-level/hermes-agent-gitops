@@ -165,6 +165,42 @@ def test_update_fires_profile_update_with_previous_fields(profile_env, hook_regi
 
 
 # ---------------------------------------------------------------------------
+# 4b. Failed update fires profile_install_failed with event="update_failed"
+# ---------------------------------------------------------------------------
+
+
+def test_failed_update_fires_failed_hook_with_update_failed_event(
+    profile_env, hook_registry
+):
+    staged = _make_staging_dir(profile_env, "upd2", version="1.0.0")
+    install_distribution(str(staged))
+
+    # Corrupt the recorded source to point somewhere unreachable, simulating
+    # a bogus/unreachable source on update — plan_install raises
+    # DistributionError re-staging it.
+    from hermes_cli.profiles import get_profile_dir
+
+    target = get_profile_dir("upd2")
+    manifest = read_manifest(target)
+    manifest.source = str(profile_env / "does_not_exist_anymore")
+    write_manifest(target, manifest)
+
+    events = []
+    _capture(hook_registry, "profile_update", events)
+    _capture(hook_registry, "profile_install_failed", events)
+
+    with pytest.raises(Exception):
+        update_distribution("upd2")
+
+    assert [e for e in events if e[0] == "profile_update"] == []
+    failed = [e for e in events if e[0] == "profile_install_failed"]
+    assert len(failed) == 1
+    kw = failed[0][1]
+    assert kw["error"]
+    assert kw["event"] == "update_failed"
+
+
+# ---------------------------------------------------------------------------
 # 4. Failed install fires profile_install_failed, not profile_install
 # ---------------------------------------------------------------------------
 
@@ -183,6 +219,30 @@ def test_failed_install_fires_failed_hook_only(profile_env, hook_registry):
     kw = failed[0][1]
     assert kw["name"] == ""
     assert kw["error"]
+    assert kw["event"] == "install_failed"
+
+
+def test_failed_install_from_reserved_name_fires_failed_hook(profile_env, hook_registry):
+    """``plan_install`` raises a bare ``ValueError`` for reserved profile
+    names (e.g. 'test') via ``validate_profile_name`` — not a
+    ``DistributionError``. The failure wrapper must still fire
+    ``profile_install_failed``, and the original ``ValueError`` must
+    propagate unchanged.
+    """
+    events = []
+    _capture(hook_registry, "profile_install", events)
+    _capture(hook_registry, "profile_install_failed", events)
+    staged = _make_staging_dir(profile_env, "test")
+
+    with pytest.raises(ValueError, match="reserved"):
+        install_distribution(str(staged))
+
+    assert [e for e in events if e[0] == "profile_install"] == []
+    failed = [e for e in events if e[0] == "profile_install_failed"]
+    assert len(failed) == 1
+    kw = failed[0][1]
+    assert kw["error"]
+    assert "reserved" in kw["error"]
     assert kw["event"] == "install_failed"
 
 

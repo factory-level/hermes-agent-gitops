@@ -791,8 +791,9 @@ def install_distribution(
     durable on disk. A subscriber (e.g. HermesVisor's gitops-emitter
     plugin) may return a fatal error dict to make this raise
     :class:`ProfileHookError` — the profile stays installed either way.
-    On any other :class:`DistributionError` (install itself failed), fires
-    ``profile_install_failed`` instead.
+    On any other :class:`DistributionError` (install itself failed) — or a
+    bare :class:`ValueError` from ``plan_install``'s profile-name validation
+    (e.g. a reserved name) — fires ``profile_install_failed`` instead.
     """
     from hermes_cli.profiles import (
         check_alias_collision,
@@ -837,7 +838,7 @@ def install_distribution(
                 event="install",
             )
             return plan
-    except DistributionError as e:
+    except (DistributionError, ValueError) as e:
         if not isinstance(e, ProfileHookError):
             _fire_profile_lifecycle_hook(
                 "profile_install_failed",
@@ -868,8 +869,9 @@ def update_distribution(
 
     Fires the ``profile_update`` lifecycle hook after the update is durable
     on disk (see :func:`install_distribution` for the fail-loud contract).
-    On any other :class:`DistributionError`, fires ``profile_install_failed``
-    (event ``"update_failed"``) instead.
+    On any other :class:`DistributionError` — or a bare :class:`ValueError`
+    from ``plan_install``'s profile-name validation (e.g. a reserved name) —
+    fires ``profile_install_failed`` (event ``"update_failed"``) instead.
     """
     from hermes_cli.profiles import (
         get_profile_dir,
@@ -931,7 +933,7 @@ def update_distribution(
                 previous_sha=previous_sha,
             )
             return plan
-    except DistributionError as e:
+    except (DistributionError, ValueError) as e:
         if not isinstance(e, ProfileHookError):
             _fire_profile_lifecycle_hook(
                 "profile_install_failed",
