@@ -212,6 +212,29 @@ VALID_HOOKS: Set[str] = {
     "kanban_task_claimed",
     "kanban_task_completed",
     "kanban_task_blocked",
+    # Profile distribution lifecycle hooks. Fired by hermes_cli.profile_distribution
+    # AFTER durable install state (manifest written, payload copied to the
+    # target profile dir) so a plugin always observes a profile that's
+    # already on disk.
+    #
+    # Kwargs for profile_install / profile_update:
+    #   name: str, source_url: str, ref: str, sha: str,
+    #   distribution_version: str, target_dir: str, event: "install" | "update"
+    # profile_update adds: previous_version: str, previous_sha: str.
+    # Kwargs for profile_install_failed:
+    #   name: str (may be "" if staging failed before name resolution),
+    #   source_url: str, ref: str, error: str,
+    #   event: "install_failed" | "update_failed"
+    #
+    # Observers by default: return None. A callback may return
+    #   {"error": str, "fatal": True, "plugin": str}
+    # to make the profile install/update command exit non-zero (the profile
+    # remains installed). Exceptions are swallowed as usual — return the
+    # error dict, don't raise. profile_install_failed callbacks are always
+    # observers only; their return values are ignored.
+    "profile_install",
+    "profile_update",
+    "profile_install_failed",
 }
 
 ENTRY_POINTS_GROUP = "hermes_agent.plugins"
