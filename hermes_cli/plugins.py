@@ -215,7 +215,10 @@ VALID_HOOKS: Set[str] = {
     # Profile distribution lifecycle hooks. Fired by hermes_cli.profile_distribution
     # AFTER durable install state (manifest written, payload copied to the
     # target profile dir) so a plugin always observes a profile that's
-    # already on disk.
+    # already on disk. This holds for profile_install / profile_update —
+    # profile_install_failed is the exception: see its own paragraph below,
+    # it can fire before anything is written (or not fire at all — see the
+    # CLI preview-gate note).
     #
     # Kwargs for profile_install / profile_update:
     #   name: str, source_url: str, ref: str, sha: str,
@@ -232,6 +235,23 @@ VALID_HOOKS: Set[str] = {
     # remains installed). Exceptions are swallowed as usual — return the
     # error dict, don't raise. profile_install_failed callbacks are always
     # observers only; their return values are ignored.
+    #
+    # profile_install_failed is BEST-EFFORT, not a complete failure signal.
+    # It fires only for failures raised from inside install_distribution() /
+    # update_distribution() itself (the copy/write phase and its own
+    # DistributionError/ValueError handling). The CLI's `hermes profile
+    # install` command runs a PREVIEW `plan_install()` call first — staging
+    # and validating the source (bad git URL, no distribution.yaml, invalid
+    # or reserved profile name, hermes_requires version mismatch, a reserved
+    # `extras` key) — BEFORE the user confirmation prompt and BEFORE
+    # install_distribution() is ever called. A failure in that preview phase
+    # never reaches this hook: it surfaces only as a normal non-zero CLI
+    # exit (`Error: ...` + `sys.exit(1)`), with no plugin callback fired at
+    # all. Consumers must not treat "profile_install_failed fired" as
+    # equivalent to "the install failed" or its absence as equivalent to
+    # "the install succeeded" — the install command's exit code is the only
+    # authoritative success/failure indicator; this hook is a best-effort
+    # notification for failures that occur after staging succeeds.
     "profile_install",
     "profile_update",
     "profile_install_failed",
