@@ -140,6 +140,16 @@ class TestManifestParsing:
     def test_read_manifest_returns_none_when_absent(self, tmp_path):
         assert read_manifest(tmp_path) is None
 
+    def test_reserved_extras_key_rejected(self, tmp_path):
+        """A manifest with a literal 'extras' key must raise DistributionError."""
+        (tmp_path / MANIFEST_FILENAME).write_text(
+            "name: bad\n"
+            "extras:\n"
+            "  deployment: {kind: worker}\n"
+        )
+        with pytest.raises(DistributionError, match="reserved top-level key 'extras'"):
+            read_manifest(tmp_path)
+
     def test_owned_paths_default(self):
         m = DistributionManifest(name="x")
         assert m.owned_paths() == list(DEFAULT_DIST_OWNED)
@@ -347,6 +357,19 @@ class TestInstall:
         staged = _make_staging_dir(profile_env, "future", manifest=mf)
         with pytest.raises(DistributionError, match="requires Hermes"):
             install_distribution(str(staged), name="future")
+
+    def test_install_rejects_literal_extras_key(self, profile_env, tmp_path):
+        """A staged manifest with a literal 'extras' key must fail with reserved-key message."""
+        staged = _make_staging_dir(profile_env, "src")
+        # Manually write distribution.yaml with a literal 'extras' key
+        (staged / MANIFEST_FILENAME).write_text(
+            "name: badextras\n"
+            "version: 0.1.0\n"
+            "extras:\n"
+            "  deployment: {kind: worker}\n"
+        )
+        with pytest.raises(DistributionError, match="reserved top-level key 'extras'"):
+            plan_install(str(staged), tmp_path / "work", override_name="badextras")
 
 
 # ===========================================================================

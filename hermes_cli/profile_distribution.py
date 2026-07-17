@@ -58,6 +58,10 @@ tool's ``deployment:`` / ``reach:`` config) — unrecognized by this
 dataclass, but preserved verbatim through install / update rather than
 being dropped. See ``DistributionManifest.extras``.
 
+**Reserved names**: The top-level key ``extras`` is reserved for internal
+use and may not appear literally in a source distribution.yaml; attempting
+to use it will raise a ``DistributionError``.
+
 Update semantics:
 
 * Distribution-owned paths (SOUL.md, mcp.json, skills/, cron/,
@@ -238,6 +242,12 @@ class DistributionManifest:
         if not isinstance(data, dict):
             raise DistributionError(
                 f"{MANIFEST_FILENAME} must be a mapping, got {type(data).__name__}"
+            )
+        # Check for reserved top-level key that would silently drop data
+        if "extras" in data:
+            raise DistributionError(
+                "distribution.yaml may not use the reserved top-level key 'extras'; "
+                "rename it to avoid data loss"
             )
         name = str(data.get("name") or "").strip()
         if not name:
