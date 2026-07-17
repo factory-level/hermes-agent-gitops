@@ -22,9 +22,14 @@ Subcommands (all live under ``hermes profile``, not a parallel tree):
 
 * A git URL (``github.com/user/repo``, ``https://github.com/...``, ``git@...``,
   ``ssh://``, ``git://``), optionally with ``#<ref>`` to pin a tag / branch /
-  commit SHA.
+  commit SHA. The resolved ref and commit SHA are recorded in the installed
+  manifest as ``installed_ref`` / ``installed_sha`` (see below); ``hermes
+  profile update`` re-pulls that same ``#<ref>`` — a branch pin re-resolves
+  to the branch's current tip, while a tag or commit-SHA pin stays fixed.
 * A local directory that already contains ``distribution.yaml`` — used
-  during profile development before the first push.
+  during profile development before the first push. Local-dir installs
+  have no ref/sha to record; ``installed_ref`` / ``installed_sha`` are
+  left empty (and omitted from the written manifest entirely).
 
 Manifest format (``distribution.yaml`` at the profile root)::
 
@@ -181,6 +186,12 @@ class DistributionManifest:
     # ``list`` can show when a distribution landed on disk.  Empty for
     # manifests that ship in a repo (authors don't populate this).
     installed_at: str = ""
+    # The ``#<ref>`` pin (tag / branch / commit SHA) and the exact commit
+    # SHA it resolved to, both captured at install/update time.  Empty for
+    # a git source with no ``#<ref>`` (installed_sha is still populated —
+    # it's HEAD's sha) and for local-directory sources (both empty).
+    installed_ref: str = ""
+    installed_sha: str = ""
 
     @classmethod
     def from_dict(cls, data: Any) -> "DistributionManifest":
@@ -210,6 +221,8 @@ class DistributionManifest:
             distribution_owned=distribution_owned,
             source=str(data.get("source") or ""),
             installed_at=str(data.get("installed_at") or ""),
+            installed_ref=str(data.get("installed_ref") or ""),
+            installed_sha=str(data.get("installed_sha") or ""),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -233,6 +246,10 @@ class DistributionManifest:
             out["source"] = self.source
         if self.installed_at:
             out["installed_at"] = self.installed_at
+        if self.installed_ref:
+            out["installed_ref"] = self.installed_ref
+        if self.installed_sha:
+            out["installed_sha"] = self.installed_sha
         return out
 
     def owned_paths(self) -> List[str]:
@@ -372,16 +389,74 @@ def _looks_like_git_url(s: str) -> bool:
     return False
 
 
-def _git_clone(url: str, dest: Path) -> None:
+def _split_source_ref(source: str) -> Tuple[str, str]:
+    """Split a trailing ``#<ref>`` off *source*.
+
+    Returns ``(url, ref)`` — ``ref`` is ``""`` when *source* has no
+    fragment.  Uses ``rsplit`` with ``maxsplit=1`` so only the final ``#``
+    is treated as the ref separator; an earlier literal ``#`` in the URL
+    itself is left alone.
+
+    Must run BEFORE ``_looks_like_git_url`` — that check knows nothing
+    about fragments (``github.com/u/r#v1`` fails its shorthand regex,
+    ``path.git#ref`` fails the ``.git``-suffix check) and is meant to stay
+    that way; ref-splitting happens one layer up, in ``_stage_source``.
+    """
+    if "#" not in source:
+        return source, ""
+    url, ref = source.rsplit("#", 1)
+    return url, ref
+
+
+def _git_clone(url: str, dest: Path, ref: str = "") -> str:
+    """Clone *url* into *dest*, optionally pinned to *ref*.
+
+    Returns the resolved commit SHA (captured before the caller strips
+    ``.git``).
+
+    * No ``ref`` — plain shallow clone of the default branch.
+    * ``ref`` given — try a shallow clone of that ref first (works for
+      both branches and tags). If that fails (``ref`` is a commit SHA,
+      which shallow clone can't target directly over most transports),
+      fall back to a full clone followed by a detached checkout of
+      ``ref`` — this covers arbitrary commit SHAs portably.
+    """
     # Normalize github.com/user/repo shorthand
     if re.match(r"^github\.com/[\w.-]+/[\w.-]+/?$", url):
         url = f"https://{url.rstrip('/')}"
     try:
-        subprocess.run(
-            ["git", "clone", "--depth", "1", url, str(dest)],
+        if not ref:
+            subprocess.run(
+                ["git", "clone", "--depth", "1", url, str(dest)],
+                check=True,
+                capture_output=True,
+            )
+        else:
+            try:
+                subprocess.run(
+                    ["git", "clone", "--depth", "1", "--branch", ref, url, str(dest)],
+                    check=True,
+                    capture_output=True,
+                )
+            except subprocess.CalledProcessError:
+                shutil.rmtree(dest, ignore_errors=True)
+                subprocess.run(
+                    ["git", "clone", url, str(dest)],
+                    check=True,
+                    capture_output=True,
+                )
+                subprocess.run(
+                    ["git", "-C", str(dest), "checkout", "--detach", ref],
+                    check=True,
+                    capture_output=True,
+                )
+        rev = subprocess.run(
+            ["git", "-C", str(dest), "rev-parse", "HEAD"],
             check=True,
             capture_output=True,
+            text=True,
         )
+        return rev.stdout.strip()
     except FileNotFoundError as exc:
         raise DistributionError("git is required for git-URL installs") from exc
     except subprocess.CalledProcessError as exc:
@@ -389,24 +464,32 @@ def _git_clone(url: str, dest: Path) -> None:
         raise DistributionError(f"git clone failed: {stderr.strip()}") from exc
 
 
-def _stage_source(source: str, workdir: Path) -> Tuple[Path, str]:
+def _stage_source(source: str, workdir: Path) -> Tuple[Path, str, str, str]:
     """Resolve *source* to a local directory containing distribution.yaml.
 
-    Returns ``(staged_dir, provenance)`` where ``provenance`` is stored in the
-    installed manifest's ``source:`` field so ``hermes profile update`` can
-    re-pull from the same place.
+    Returns ``(staged_dir, provenance, ref, sha)``:
+
+    * ``provenance`` is stored verbatim (including any ``#<ref>``) in the
+      installed manifest's ``source:`` field so ``hermes profile update``
+      re-pulls from the same place — and re-resolves the same pin (a
+      branch pin follows the branch; a tag / commit-SHA pin stays fixed).
+    * ``ref`` / ``sha`` are the resolved git ref and commit SHA. Both are
+      ``""`` for local-directory sources, which have no ref pin at all.
 
     Accepts:
-      * A git URL (https / ssh / git@ / bare github.com shorthand) — cloned
-        into a temp directory; ``.git`` removed after clone.
+      * A git URL (https / ssh / git@ / bare github.com shorthand),
+        optionally suffixed with ``#<ref>`` — cloned into a temp
+        directory; ``.git`` removed after clone.
       * A local directory already containing ``distribution.yaml``.
     """
     src_str = source.strip()
+    url_part, ref = _split_source_ref(src_str)
 
-    # Git URL
-    if _looks_like_git_url(src_str):
+    # Git URL — ref-split url_part is what _looks_like_git_url evaluates,
+    # per the fragment-free contract documented on _split_source_ref.
+    if _looks_like_git_url(url_part):
         cloned = workdir / "clone"
-        _git_clone(src_str, cloned)
+        sha = _git_clone(url_part, cloned, ref=ref)
         # Remove .git to keep the staged tree clean
         shutil.rmtree(cloned / ".git", ignore_errors=True)
         if not (cloned / MANIFEST_FILENAME).is_file():
@@ -414,9 +497,11 @@ def _stage_source(source: str, workdir: Path) -> Tuple[Path, str]:
                 f"No {MANIFEST_FILENAME} at the root of {src_str!r}. "
                 "This repository is not a Hermes profile distribution."
             )
-        return cloned, src_str
+        return cloned, src_str, ref, sha
 
-    # Local directory
+    # Local directory — use the ORIGINAL (unsplit) string. Local sources
+    # don't support ref pins; a literal '#' in a local path is just part
+    # of the path, not a fragment to strip.
     path_guess = Path(src_str).expanduser()
     if path_guess.is_dir():
         if not (path_guess / MANIFEST_FILENAME).is_file():
@@ -424,7 +509,7 @@ def _stage_source(source: str, workdir: Path) -> Tuple[Path, str]:
                 f"No {MANIFEST_FILENAME} in {path_guess}. "
                 "A local-directory source must contain a distribution.yaml at its root."
             )
-        return path_guess.resolve(), str(path_guess.resolve())
+        return path_guess.resolve(), str(path_guess.resolve()), "", ""
 
     raise DistributionError(
         f"Cannot resolve distribution source: {source!r}. "
@@ -462,6 +547,8 @@ class InstallPlan:
     preserves_config: bool = True
     has_cron: bool = False
     has_skills: bool = False
+    ref: str = ""
+    sha: str = ""
 
 
 def _has_cron_jobs(staged: Path) -> bool:
@@ -497,7 +584,7 @@ def plan_install(
     )
     from hermes_cli import __version__ as hermes_version
 
-    staged, provenance = _stage_source(source, workdir)
+    staged, provenance, ref, sha = _stage_source(source, workdir)
     _reject_distribution_symlinks(staged)
     manifest = read_manifest(staged)
     if manifest is None:
@@ -521,6 +608,8 @@ def plan_install(
         )
     manifest.name = canon
     manifest.source = provenance
+    manifest.installed_ref = ref
+    manifest.installed_sha = sha
     # Stamped once here so plan_install() callers (both fresh install and
     # update) propagate a freshly-minted timestamp through _copy_dist_payload.
     manifest.installed_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -539,6 +628,8 @@ def plan_install(
         preserves_config=existing,
         has_cron=has_cron,
         has_skills=skill_count > 0,
+        ref=ref,
+        sha=sha,
     )
 
 
