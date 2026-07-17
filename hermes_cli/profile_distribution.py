@@ -66,6 +66,8 @@ Update semantics:
 
 from __future__ import annotations
 
+import logging
+import os
 import re
 import shutil
 import subprocess
@@ -76,6 +78,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from agent.skill_utils import is_excluded_skill_path
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -131,6 +135,20 @@ USER_OWNED_EXCLUDE: frozenset = frozenset({
 
 class DistributionError(Exception):
     """Raised for distribution install/update failures."""
+
+
+class ProfileHookError(DistributionError):
+    """Raised when a strict profile lifecycle hook demands fail-loud exit.
+
+    Fired either by a callback returning ``{"error": ..., "fatal": True}``
+    (a subscriber, e.g. the gitops-emitter plugin, hit an unrecoverable
+    error pushing the install record) or by the ``HERMESVISOR_REQUIRE_EMITTER``
+    guard finding no subscriber at all. In both cases the profile itself is
+    already durably installed on disk — only the CLI's exit code reflects
+    the hook failure (see ``cmd_profile``'s existing
+    ``except (DistributionError, ValueError)`` handler, which this subclass
+    routes through unchanged).
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -694,6 +712,70 @@ def _bootstrap_user_dirs(target: Path) -> None:
         (target / d).mkdir(parents=True, exist_ok=True)
 
 
+def _fragment_free_source_url(provenance: str, ref: str) -> str:
+    """Strip a trailing ``#<ref>`` from *provenance* for hook payloads.
+
+    ``provenance`` (``InstallPlan.provenance`` / the manifest's ``source:``
+    field) is stored verbatim, fragment included, so ``update`` re-resolves
+    the same pin. Hook payloads want the two separated (``source_url`` +
+    ``ref``). Only strips when *ref* is non-empty — local-directory sources
+    never have a ref (``ref`` is always ``""`` for them), so a literal
+    ``#`` in a local path is never touched.
+    """
+    if ref and provenance.endswith(f"#{ref}"):
+        return provenance[: -(len(ref) + 1)]
+    return provenance
+
+
+def _fire_profile_lifecycle_hook(hook_name: str, *, strict: bool, **fields: Any) -> None:
+    """Fire a profile lifecycle plugin hook, best-effort at the infra layer.
+
+    Called by install/update AFTER durable install state (manifest written,
+    payload copied to the target profile dir) so a plugin callback always
+    observes a profile that's already on disk. Plugin discovery does not
+    run on the profile install/update path otherwise, so this fires it
+    itself (idempotent — a no-op once already discovered).
+
+    Any infra failure (plugins unavailable, discovery error) is swallowed —
+    a misbehaving or absent plugin subsystem must never block an install.
+
+    When *strict* is True (``profile_install`` / ``profile_update``), a
+    callback may opt the CLI into fail-loud behavior by returning
+    ``{"error": str, "fatal": True, "plugin": str}`` — see the
+    ``profile_install`` entry in ``VALID_HOOKS`` for the full contract.
+    ``profile_install_failed`` is always fired with ``strict=False``: it's
+    observer-only, so a failing push there can't also fail the failure
+    report.
+    """
+    try:
+        from hermes_cli.plugins import discover_plugins, has_hook, invoke_hook
+
+        discover_plugins()
+        results = invoke_hook(hook_name, **fields)
+    except Exception as exc:  # infra failure = best-effort, never blocks the install
+        logger.debug("profile lifecycle hook %s failed: %s", hook_name, exc)
+        return
+
+    if not strict:
+        return
+
+    if (
+        os.environ.get("HERMESVISOR_REQUIRE_EMITTER") == "1"
+        and not results
+        and not has_hook(hook_name)
+    ):
+        raise ProfileHookError(
+            f"HERMESVISOR_REQUIRE_EMITTER=1 but no plugin is subscribed to {hook_name}"
+        )
+
+    fatal = [r for r in results if isinstance(r, dict) and r.get("fatal") and r.get("error")]
+    if fatal:
+        raise ProfileHookError(
+            "Profile was installed, but a post-install hook failed: "
+            + "; ".join(f"[{f.get('plugin', '?')}] {f['error']}" for f in fatal)
+        )
+
+
 def install_distribution(
     source: str,
     name: Optional[str] = None,
@@ -704,37 +786,73 @@ def install_distribution(
 
     Returns the resolved :class:`InstallPlan`.  Use :func:`plan_install`
     first if you want to preview + prompt the user before calling this.
+
+    Fires the ``profile_install`` lifecycle hook after the install is
+    durable on disk. A subscriber (e.g. HermesVisor's gitops-emitter
+    plugin) may return a fatal error dict to make this raise
+    :class:`ProfileHookError` — the profile stays installed either way.
+    On any other :class:`DistributionError` (install itself failed), fires
+    ``profile_install_failed`` instead.
     """
     from hermes_cli.profiles import (
         check_alias_collision,
         create_wrapper_script,
     )
 
-    with tempfile.TemporaryDirectory(prefix="hermes_dist_install_") as tmp:
-        plan = plan_install(source, Path(tmp), override_name=name)
+    plan: Optional[InstallPlan] = None
+    try:
+        with tempfile.TemporaryDirectory(prefix="hermes_dist_install_") as tmp:
+            plan = plan_install(source, Path(tmp), override_name=name)
 
-        if plan.existing and not force:
-            raise DistributionError(
-                f"Profile '{plan.manifest.name}' already exists at {plan.target_dir}. "
-                "Use `hermes profile update` to upgrade in place, "
-                "or pass --force to overwrite."
+            if plan.existing and not force:
+                raise DistributionError(
+                    f"Profile '{plan.manifest.name}' already exists at {plan.target_dir}. "
+                    "Use `hermes profile update` to upgrade in place, "
+                    "or pass --force to overwrite."
+                )
+
+            # Fresh install: config.yaml comes from the distribution.
+            _bootstrap_user_dirs(plan.target_dir)
+            _copy_dist_payload(
+                plan.staged_dir,
+                plan.target_dir,
+                plan.manifest,
+                preserve_config=False,
             )
 
-        # Fresh install: config.yaml comes from the distribution.
-        _bootstrap_user_dirs(plan.target_dir)
-        _copy_dist_payload(
-            plan.staged_dir,
-            plan.target_dir,
-            plan.manifest,
-            preserve_config=False,
-        )
+            if create_alias:
+                collision = check_alias_collision(plan.manifest.name)
+                if collision is None:
+                    create_wrapper_script(plan.manifest.name)
 
-        if create_alias:
-            collision = check_alias_collision(plan.manifest.name)
-            if collision is None:
-                create_wrapper_script(plan.manifest.name)
-
-        return plan
+            _fire_profile_lifecycle_hook(
+                "profile_install",
+                strict=True,
+                name=plan.manifest.name,
+                source_url=_fragment_free_source_url(plan.provenance, plan.ref),
+                ref=plan.ref,
+                sha=plan.sha,
+                distribution_version=plan.manifest.version,
+                target_dir=str(plan.target_dir),
+                event="install",
+            )
+            return plan
+    except DistributionError as e:
+        if not isinstance(e, ProfileHookError):
+            _fire_profile_lifecycle_hook(
+                "profile_install_failed",
+                strict=False,
+                name=plan.manifest.name if plan is not None else "",
+                source_url=(
+                    _fragment_free_source_url(plan.provenance, plan.ref)
+                    if plan is not None
+                    else source
+                ),
+                ref=plan.ref if plan is not None else "",
+                error=str(e),
+                event="install_failed",
+            )
+        raise
 
 
 def update_distribution(
@@ -747,6 +865,11 @@ def update_distribution(
     ``source:`` field.  Distribution-owned files are overwritten; user-owned
     data (memories, sessions, auth) is never touched.  ``config.yaml`` is
     preserved unless ``force_config`` is True.
+
+    Fires the ``profile_update`` lifecycle hook after the update is durable
+    on disk (see :func:`install_distribution` for the fail-loud contract).
+    On any other :class:`DistributionError`, fires ``profile_install_failed``
+    (event ``"update_failed"``) instead.
     """
     from hermes_cli.profiles import (
         get_profile_dir,
@@ -772,21 +895,58 @@ def update_distribution(
             "`hermes profile install <source> --name {canon} --force`."
         )
 
-    with tempfile.TemporaryDirectory(prefix="hermes_dist_update_") as tmp:
-        plan = plan_install(
-            existing_manifest.source,
-            Path(tmp),
-            override_name=canon,
-        )
-        plan.preserves_config = not force_config
+    # Captured BEFORE re-staging — plan_install below overwrites plan.manifest
+    # with the newly-staged version's fields.
+    previous_version = existing_manifest.version
+    previous_sha = existing_manifest.installed_sha
 
-        _copy_dist_payload(
-            plan.staged_dir,
-            plan.target_dir,
-            plan.manifest,
-            preserve_config=plan.preserves_config,
-        )
-        return plan
+    plan: Optional[InstallPlan] = None
+    try:
+        with tempfile.TemporaryDirectory(prefix="hermes_dist_update_") as tmp:
+            plan = plan_install(
+                existing_manifest.source,
+                Path(tmp),
+                override_name=canon,
+            )
+            plan.preserves_config = not force_config
+
+            _copy_dist_payload(
+                plan.staged_dir,
+                plan.target_dir,
+                plan.manifest,
+                preserve_config=plan.preserves_config,
+            )
+
+            _fire_profile_lifecycle_hook(
+                "profile_update",
+                strict=True,
+                name=plan.manifest.name,
+                source_url=_fragment_free_source_url(plan.provenance, plan.ref),
+                ref=plan.ref,
+                sha=plan.sha,
+                distribution_version=plan.manifest.version,
+                target_dir=str(plan.target_dir),
+                event="update",
+                previous_version=previous_version,
+                previous_sha=previous_sha,
+            )
+            return plan
+    except DistributionError as e:
+        if not isinstance(e, ProfileHookError):
+            _fire_profile_lifecycle_hook(
+                "profile_install_failed",
+                strict=False,
+                name=plan.manifest.name if plan is not None else canon,
+                source_url=(
+                    _fragment_free_source_url(plan.provenance, plan.ref)
+                    if plan is not None
+                    else existing_manifest.source
+                ),
+                ref=plan.ref if plan is not None else "",
+                error=str(e),
+                event="update_failed",
+            )
+        raise
 
 
 # ---------------------------------------------------------------------------
