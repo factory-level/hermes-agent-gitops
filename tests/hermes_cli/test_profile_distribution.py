@@ -657,6 +657,119 @@ class TestProfileInfoDistribution:
 # ===========================================================================
 
 
+class TestExtrasPreservation:
+    """Unknown top-level keys in distribution.yaml (vendor extension blocks,
+    e.g. HermesVisor's `deployment:` / `reach:` / `workloads:` / `expose:`)
+    must round-trip through install/update instead of being silently
+    stripped by to_dict()'s known-fields-only serialization."""
+
+    def test_from_dict_captures_unknown_keys_as_extras(self):
+        m = DistributionManifest.from_dict({
+            "name": "x",
+            "deployment": {"kind": "worker", "replicas": 3},
+            "workloads": [{"name": "a"}, {"name": "b"}],
+        })
+        assert m.extras == {
+            "deployment": {"kind": "worker", "replicas": 3},
+            "workloads": [{"name": "a"}, {"name": "b"}],
+        }
+
+    def test_to_dict_reemits_extras_after_known_keys(self):
+        m = DistributionManifest.from_dict({
+            "name": "x",
+            "version": "1.0.0",
+            "deployment": {"kind": "worker"},
+        })
+        out = m.to_dict()
+        assert out["deployment"] == {"kind": "worker"}
+        keys = list(out.keys())
+        assert keys.index("deployment") > keys.index("version")
+
+    def test_vanilla_manifest_never_emits_literal_extras_key(self):
+        m = DistributionManifest(name="plain", version="1.0.0")
+        out = m.to_dict()
+        assert "extras" not in out
+        assert m.extras == {}
+
+    def test_known_runtime_fields_are_not_double_handled_as_extras(self):
+        m = DistributionManifest.from_dict({
+            "name": "x",
+            "source": "github.com/u/r",
+            "installed_at": "2024-01-01T00:00:00+00:00",
+            "installed_ref": "v1",
+            "installed_sha": "deadbeef",
+        })
+        assert m.extras == {}
+        assert m.source == "github.com/u/r"
+        assert m.installed_ref == "v1"
+        assert m.installed_sha == "deadbeef"
+
+    def test_from_dict_to_dict_roundtrip_with_extras(self, tmp_path):
+        raw = {
+            "name": "rt",
+            "version": "2.0.0",
+            "deployment": {"kind": "worker", "replicas": 3, "env": {"A": "1"}},
+            "workloads": [{"name": "a", "cpu": 1}, {"name": "b", "cpu": 2}],
+            "expose": ["8080/tcp"],
+        }
+        write_manifest(tmp_path, DistributionManifest.from_dict(raw))
+        reparsed = read_manifest(tmp_path)
+        assert reparsed.to_dict()["deployment"] == raw["deployment"]
+        assert reparsed.to_dict()["workloads"] == raw["workloads"]
+        assert reparsed.to_dict()["expose"] == raw["expose"]
+
+    def test_from_dict_to_dict_roundtrip_without_extras_unchanged(self):
+        raw = {"name": "plain", "version": "1.0.0", "description": "no extras here"}
+        m = DistributionManifest.from_dict(raw)
+        out = m.to_dict()
+        assert "extras" not in out
+        assert out == {"name": "plain", "version": "1.0.0", "description": "no extras here"}
+
+    def test_install_preserves_extension_blocks_on_disk(self, profile_env):
+        mf = DistributionManifest.from_dict({
+            "name": "vendorext",
+            "version": "0.1.0",
+            "deployment": {"kind": "worker", "replicas": 3},
+            "workloads": [{"name": "svc-a"}, {"name": "svc-b"}],
+        })
+        staged = _make_staging_dir(profile_env, "vendorext", manifest=mf)
+        plan = install_distribution(str(staged), name="vendorext")
+
+        import yaml
+        installed_raw = yaml.safe_load(
+            (plan.target_dir / MANIFEST_FILENAME).read_text()
+        )
+        assert installed_raw["deployment"] == {"kind": "worker", "replicas": 3}
+        assert installed_raw["workloads"] == [{"name": "svc-a"}, {"name": "svc-b"}]
+
+    def test_update_preserves_extension_blocks(self, profile_env):
+        mf = DistributionManifest.from_dict({
+            "name": "vendorext2",
+            "version": "0.1.0",
+            "reach": {"tags": ["prod", "eu"]},
+        })
+        staged = _make_staging_dir(profile_env, "vendorext2", manifest=mf)
+        install_distribution(str(staged), name="vendorext2")
+
+        # Author bumps version in staging (still carrying the extension block)
+        mf2 = DistributionManifest.from_dict({
+            "name": "vendorext2",
+            "version": "0.2.0",
+            "reach": {"tags": ["prod", "eu", "us"]},
+        })
+        write_manifest(staged, mf2)
+
+        update_distribution("vendorext2", force_config=False)
+
+        import yaml
+        from hermes_cli.profiles import get_profile_dir
+        installed_raw = yaml.safe_load(
+            (get_profile_dir("vendorext2") / MANIFEST_FILENAME).read_text()
+        )
+        assert installed_raw["reach"] == {"tags": ["prod", "eu", "us"]}
+        assert installed_raw["version"] == "0.2.0"
+
+
 class TestErrorSurfaces:
 
     def test_bad_profile_name_raises_valueerror_not_traceback(self, profile_env, tmp_path):

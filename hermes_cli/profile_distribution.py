@@ -53,6 +53,11 @@ Manifest format (``distribution.yaml`` at the profile root)::
       - cron/
       - mcp.json
 
+Any other top-level key is a vendor extension block (e.g. a downstream
+tool's ``deployment:`` / ``reach:`` config) — unrecognized by this
+dataclass, but preserved verbatim through install / update rather than
+being dropped. See ``DistributionManifest.extras``.
+
 Update semantics:
 
 * Distribution-owned paths (SOUL.md, mcp.json, skills/, cron/,
@@ -75,7 +80,7 @@ import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, ClassVar, Dict, FrozenSet, List, Optional, Tuple
 
 from agent.skill_utils import is_excluded_skill_path
 
@@ -210,6 +215,23 @@ class DistributionManifest:
     # it's HEAD's sha) and for local-directory sources (both empty).
     installed_ref: str = ""
     installed_sha: str = ""
+    # Unknown top-level keys from the source distribution.yaml — vendor
+    # extension blocks (e.g. HermesVisor's ``deployment:`` / ``reach:`` /
+    # ``workloads:`` / ``expose:``, but generically ANY key an author adds
+    # that this dataclass doesn't know about). Captured verbatim in
+    # from_dict() and re-emitted as-is in to_dict() so install/update never
+    # silently drops them. Never populated by hand — always derived from
+    # the parsed manifest.
+    extras: Dict[str, Any] = field(default_factory=dict)
+
+    # Every field name this dataclass understands — anything else in a
+    # parsed manifest's top-level mapping falls through to ``extras``.
+    # ClassVar so dataclass doesn't treat this as an instance field.
+    _KNOWN_KEYS: ClassVar[FrozenSet[str]] = frozenset({
+        "name", "version", "description", "hermes_requires", "author",
+        "license", "env_requires", "distribution_owned", "source",
+        "installed_at", "installed_ref", "installed_sha", "extras",
+    })
 
     @classmethod
     def from_dict(cls, data: Any) -> "DistributionManifest":
@@ -228,6 +250,7 @@ class DistributionManifest:
         if dist_owned_raw and not isinstance(dist_owned_raw, list):
             raise DistributionError("distribution_owned must be a list")
         distribution_owned = [str(p).strip().strip("/") for p in dist_owned_raw if str(p).strip()]
+        extras = {k: v for k, v in data.items() if k not in cls._KNOWN_KEYS}
         return cls(
             name=name,
             version=str(data.get("version") or "0.1.0"),
@@ -241,6 +264,7 @@ class DistributionManifest:
             installed_at=str(data.get("installed_at") or ""),
             installed_ref=str(data.get("installed_ref") or ""),
             installed_sha=str(data.get("installed_sha") or ""),
+            extras=extras,
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -268,6 +292,8 @@ class DistributionManifest:
             out["installed_ref"] = self.installed_ref
         if self.installed_sha:
             out["installed_sha"] = self.installed_sha
+        for key, value in self.extras.items():
+            out[key] = value
         return out
 
     def owned_paths(self) -> List[str]:
