@@ -462,6 +462,128 @@ def _split_source_ref(source: str) -> Tuple[str, str]:
     return url, ref
 
 
+_SUBDIR_PARAM = "subdirectory="
+
+
+def _parse_fragment(fragment: str) -> Tuple[str, str]:
+    """Parse a source fragment into ``(ref, subdir)``.
+
+    Pip-style grammar: ``<ref>``, ``subdirectory=<path>``, or
+    ``<ref>&subdirectory=<path>``. Splitting uses ``rpartition("&")`` and
+    only treats the tail as a subdirectory parameter when it starts with
+    ``subdirectory=`` — so a ref whose name contains a literal ``&``
+    still round-trips (``a&b`` -> ref ``a&b``). Two shapes are
+    deliberately inexpressible and pathological enough not to matter: a
+    ref literally named ``subdirectory=...`` and a ref ending in
+    ``&subdirectory=...``.
+    """
+    if not fragment:
+        return "", ""
+    if fragment.startswith(_SUBDIR_PARAM):
+        ref, subdir = "", fragment[len(_SUBDIR_PARAM):]
+    else:
+        head, sep, tail = fragment.rpartition("&")
+        if sep and tail.startswith(_SUBDIR_PARAM):
+            ref, subdir = head, tail[len(_SUBDIR_PARAM):]
+        else:
+            return fragment, ""
+    if not subdir:
+        raise DistributionError(
+            f"Empty {_SUBDIR_PARAM} value in source fragment {fragment!r}."
+        )
+    if _SUBDIR_PARAM in ref or ref.startswith(_SUBDIR_PARAM):
+        raise DistributionError(
+            f"Multiple {_SUBDIR_PARAM} parameters in source fragment "
+            f"{fragment!r} — pass exactly one."
+        )
+    return ref, subdir
+
+
+def _normalize_subdir(subdir: str) -> str:
+    """Validate and normalize a distribution subdirectory path.
+
+    Accepts only a relative path inside the source tree; returns the
+    cleaned ``/``-joined form (``./x/`` -> ``x``).
+    """
+    def _bad() -> "DistributionError":
+        return DistributionError(
+            f"Invalid distribution subdirectory {subdir!r}: must be a "
+            "relative path inside the repository (no leading '/', no "
+            "'..', no backslashes)."
+        )
+
+    if "\\" in subdir or subdir.startswith("/"):
+        raise _bad()
+    parts = [p for p in subdir.split("/") if p not in ("", ".")]
+    if not parts or any(p == ".." for p in parts):
+        raise _bad()
+    return "/".join(parts)
+
+
+def _merge_subdir(frag_subdir: str, flag_subdir: str) -> str:
+    """Combine fragment- and flag-supplied subdirs (both optional).
+
+    Both are normalized; giving both is allowed only when they agree.
+    """
+    frag = _normalize_subdir(frag_subdir) if frag_subdir else ""
+    flag = _normalize_subdir(flag_subdir) if flag_subdir else ""
+    if frag and flag and frag != flag:
+        raise DistributionError(
+            f"Conflicting subdirectories: --subdir {flag!r} vs source "
+            f"fragment 'subdirectory={frag}'. Pass just one (they must "
+            "match if both are given)."
+        )
+    return frag or flag
+
+
+def _descend_subdir(root: Path, subdir: str, source_label: str) -> Path:
+    """Return ``root/subdir`` after safety checks.
+
+    Rejects symlinked path components (they would smuggle content past
+    the per-tree symlink scan, which only covers the final subtree),
+    escapes outside *root*, and missing directories — each with a
+    message naming the exact path.
+    """
+    walk = root
+    for part in subdir.split("/"):
+        walk = walk / part
+        if walk.is_symlink():
+            raise DistributionError(
+                f"Distribution subdirectory path contains a symlink: {subdir!r}"
+            )
+    resolved = walk.resolve()
+    root_resolved = root.resolve()
+    if not (resolved == root_resolved or root_resolved in resolved.parents):
+        raise DistributionError(
+            f"Invalid distribution subdirectory {subdir!r}: must be a "
+            "relative path inside the repository (no leading '/', no "
+            "'..', no backslashes)."
+        )
+    if not walk.is_dir():
+        raise DistributionError(
+            f"Subdirectory {subdir!r} does not exist in {source_label!r}."
+        )
+    return walk
+
+
+def _canonical_provenance(url: str, ref: str, subdir: str) -> str:
+    """Rebuild the recorded ``source:`` string from its parts.
+
+    Byte-identical to the historical verbatim behavior for ref-only
+    sources; a subdir (whether it arrived via the fragment or the
+    ``--subdir`` flag) is baked in as ``subdirectory=`` so
+    ``hermes profile update`` re-resolves it with no extra manifest
+    fields.
+    """
+    if ref and subdir:
+        return f"{url}#{ref}&{_SUBDIR_PARAM}{subdir}"
+    if subdir:
+        return f"{url}#{_SUBDIR_PARAM}{subdir}"
+    if ref:
+        return f"{url}#{ref}"
+    return url
+
+
 def _git_clone(url: str, dest: Path, ref: str = "") -> str:
     """Clone *url* into *dest*, optionally pinned to *ref*.
 
@@ -518,52 +640,105 @@ def _git_clone(url: str, dest: Path, ref: str = "") -> str:
         raise DistributionError(f"git clone failed: {stderr.strip()}") from exc
 
 
-def _stage_source(source: str, workdir: Path) -> Tuple[Path, str, str, str]:
+def _stage_source(
+    source: str, workdir: Path, subdir: str = ""
+) -> Tuple[Path, str, str, str, str]:
     """Resolve *source* to a local directory containing distribution.yaml.
 
-    Returns ``(staged_dir, provenance, ref, sha)``:
+    Returns ``(staged_dir, provenance, ref, sha, subdir)``:
 
-    * ``provenance`` is stored verbatim (including any ``#<ref>``) in the
-      installed manifest's ``source:`` field so ``hermes profile update``
-      re-pulls from the same place — and re-resolves the same pin (a
-      branch pin follows the branch; a tag / commit-SHA pin stays fixed).
+    * ``provenance`` is the canonical source string (url + ``#<ref>`` /
+      ``subdirectory=<path>`` fragment, rebuilt via
+      ``_canonical_provenance``) stored in the installed manifest's
+      ``source:`` field so ``hermes profile update`` re-pulls from the
+      same place — and re-resolves the same pin (a branch pin follows
+      the branch; a tag / commit-SHA pin stays fixed; a subdir is baked
+      into the fragment so it round-trips with no extra manifest
+      fields). Byte-identical to the pre-subdir verbatim behavior for
+      every previously-valid source.
     * ``ref`` / ``sha`` are the resolved git ref and commit SHA. Both are
       ``""`` for local-directory sources, which have no ref pin at all.
+    * ``subdir`` is the normalized effective subdirectory (``""`` when
+      the distribution is at the source root — including local installs,
+      whose provenance points directly at the resolved subtree, see
+      below).
 
     Accepts:
       * A git URL (https / ssh / git@ / bare github.com shorthand),
-        optionally suffixed with ``#<ref>`` — cloned into a temp
-        directory; ``.git`` removed after clone.
-      * A local directory already containing ``distribution.yaml``.
+        optionally suffixed with a fragment: ``#<ref>``,
+        ``#subdirectory=<path>``, or ``#<ref>&subdirectory=<path>`` —
+        cloned into a temp directory; ``.git`` removed after clone; the
+        distribution root is the named subdirectory when one is given.
+      * A local directory containing ``distribution.yaml`` at its root
+        (or under *subdir* when given). A literal ``#`` in an EXISTING
+        local path is still part of the path, never a fragment; the
+        fragment form is honored for local dirs only when the literal
+        path does not exist. Local provenance records the resolved
+        SUBTREE path (no fragment) — updating re-stages that directory
+        as its own root, which is equivalent.
     """
     src_str = source.strip()
-    url_part, ref = _split_source_ref(src_str)
+    url_part, fragment = _split_source_ref(src_str)
 
     # Git URL — ref-split url_part is what _looks_like_git_url evaluates,
     # per the fragment-free contract documented on _split_source_ref.
     if _looks_like_git_url(url_part):
+        ref, frag_subdir = _parse_fragment(fragment)
+        eff_subdir = _merge_subdir(frag_subdir, subdir)
         cloned = workdir / "clone"
         sha = _git_clone(url_part, cloned, ref=ref)
         # Remove .git to keep the staged tree clean
         shutil.rmtree(cloned / ".git", ignore_errors=True)
-        if not (cloned / MANIFEST_FILENAME).is_file():
+        staged = (
+            _descend_subdir(cloned, eff_subdir, url_part) if eff_subdir else cloned
+        )
+        if not (staged / MANIFEST_FILENAME).is_file():
+            if eff_subdir:
+                raise DistributionError(
+                    f"No {MANIFEST_FILENAME} at {eff_subdir}/{MANIFEST_FILENAME} "
+                    f"in {url_part!r}. This subdirectory is not a Hermes "
+                    "profile distribution."
+                )
             raise DistributionError(
                 f"No {MANIFEST_FILENAME} at the root of {src_str!r}. "
                 "This repository is not a Hermes profile distribution."
             )
-        return cloned, src_str, ref, sha
+        provenance = _canonical_provenance(url_part, ref, eff_subdir)
+        return staged, provenance, ref, sha, eff_subdir
 
-    # Local directory — use the ORIGINAL (unsplit) string. Local sources
-    # don't support ref pins; a literal '#' in a local path is just part
-    # of the path, not a fragment to strip.
+    # Local directory — the ORIGINAL (unsplit) string wins when it names
+    # an existing directory: a literal '#' in a local path is part of the
+    # path, not a fragment (long-standing behavior). Only when the literal
+    # path does NOT exist do we consider a fragment-bearing local source.
     path_guess = Path(src_str).expanduser()
+    frag_subdir = ""
+    if not path_guess.is_dir() and fragment:
+        ref_candidate, frag_subdir = _parse_fragment(fragment)
+        if frag_subdir and not ref_candidate and Path(url_part).expanduser().is_dir():
+            # Local dirs have no ref pins; only a pure-subdir fragment is
+            # meaningful here.
+            path_guess = Path(url_part).expanduser()
+        else:
+            frag_subdir = ""
     if path_guess.is_dir():
-        if not (path_guess / MANIFEST_FILENAME).is_file():
+        eff_subdir = _merge_subdir(frag_subdir, subdir)
+        root = path_guess.resolve()
+        staged = (
+            _descend_subdir(root, eff_subdir, str(root)) if eff_subdir else root
+        )
+        if not (staged / MANIFEST_FILENAME).is_file():
             raise DistributionError(
-                f"No {MANIFEST_FILENAME} in {path_guess}. "
-                "A local-directory source must contain a distribution.yaml at its root."
+                f"No {MANIFEST_FILENAME} in {staged}. "
+                "A local-directory source must contain a distribution.yaml "
+                "at its root (or under the given --subdir)."
             )
-        return path_guess.resolve(), str(path_guess.resolve()), "", ""
+        # Provenance = the resolved subtree itself, and the reported
+        # subdir is "" to match: the (source, subdir) pair must always
+        # compose to the dist root, and here the recorded source ALREADY
+        # points at the subtree — hook consumers (e.g. the gitops-emitter)
+        # resolve <source>/<subdir> and must not descend twice. Future
+        # updates re-stage the subtree directly as their own root.
+        return staged.resolve(), str(staged.resolve()), "", "", ""
 
     raise DistributionError(
         f"Cannot resolve distribution source: {source!r}. "
@@ -603,6 +778,7 @@ class InstallPlan:
     has_skills: bool = False
     ref: str = ""
     sha: str = ""
+    subdir: str = ""
 
 
 def _has_cron_jobs(staged: Path) -> bool:
@@ -629,8 +805,14 @@ def plan_install(
     source: str,
     workdir: Path,
     override_name: Optional[str] = None,
+    subdir: str = "",
 ) -> InstallPlan:
-    """Stage *source* and produce a plan describing what install would do."""
+    """Stage *source* and produce a plan describing what install would do.
+
+    *subdir* is the ``--subdir`` flag value; a subdirectory may equally
+    arrive via the source fragment (``#subdirectory=<path>``) — see
+    ``_stage_source``.
+    """
     from hermes_cli.profiles import (
         get_profile_dir,
         normalize_profile_name,
@@ -638,7 +820,9 @@ def plan_install(
     )
     from hermes_cli import __version__ as hermes_version
 
-    staged, provenance, ref, sha = _stage_source(source, workdir)
+    staged, provenance, ref, sha, subdir_resolved = _stage_source(
+        source, workdir, subdir=subdir
+    )
     _reject_distribution_symlinks(staged)
     manifest = read_manifest(staged)
     if manifest is None:
@@ -684,6 +868,7 @@ def plan_install(
         has_skills=skill_count > 0,
         ref=ref,
         sha=sha,
+        subdir=subdir_resolved,
     )
 
 
@@ -748,19 +933,49 @@ def _bootstrap_user_dirs(target: Path) -> None:
         (target / d).mkdir(parents=True, exist_ok=True)
 
 
-def _fragment_free_source_url(provenance: str, ref: str) -> str:
-    """Strip a trailing ``#<ref>`` from *provenance* for hook payloads.
+def _fragment_free_source_url(provenance: str, ref: str, subdir: str = "") -> str:
+    """Strip the canonical fragment from *provenance* for hook payloads.
 
     ``provenance`` (``InstallPlan.provenance`` / the manifest's ``source:``
-    field) is stored verbatim, fragment included, so ``update`` re-resolves
-    the same pin. Hook payloads want the two separated (``source_url`` +
-    ``ref``). Only strips when *ref* is non-empty — local-directory sources
-    never have a ref (``ref`` is always ``""`` for them), so a literal
-    ``#`` in a local path is never touched.
+    field) carries the canonical fragment (``#<ref>``,
+    ``#subdirectory=<path>``, or ``#<ref>&subdirectory=<path>``) so
+    ``update`` re-resolves the same pin. Hook payloads want the parts
+    separated (``source_url`` + ``ref`` + ``subdir``). Only strips when a
+    matching canonical fragment is present — local-directory sources have
+    empty ref AND subdir-free provenance (it points at the subtree), so a
+    literal ``#`` in a local path is never touched.
     """
-    if ref and provenance.endswith(f"#{ref}"):
-        return provenance[: -(len(ref) + 1)]
+    candidates = []
+    if ref and subdir:
+        candidates.append(f"{ref}&{_SUBDIR_PARAM}{subdir}")
+    if subdir:
+        candidates.append(f"{_SUBDIR_PARAM}{subdir}")
+    if ref:
+        candidates.append(ref)
+    for frag in candidates:
+        if provenance.endswith(f"#{frag}"):
+            return provenance[: -(len(frag) + 1)]
     return provenance
+
+
+def _split_source_for_hooks(source: str) -> Tuple[str, str, str]:
+    """Best-effort ``(source_url, ref, subdir)`` split for FAILURE hooks.
+
+    Used when staging died before ``plan_install`` returned — mirrors the
+    success-path payload contract without ever raising (an unparseable
+    fragment degrades to the old two-way split).
+    """
+    url, fragment = _split_source_ref(source)
+    try:
+        ref, subdir = _parse_fragment(fragment)
+    except DistributionError:
+        return url, fragment, ""
+    if subdir:
+        try:
+            subdir = _normalize_subdir(subdir)
+        except DistributionError:
+            return url, fragment, ""
+    return url, ref, subdir
 
 
 def _fire_profile_lifecycle_hook(hook_name: str, *, strict: bool, **fields: Any) -> None:
@@ -814,6 +1029,7 @@ def install_distribution(
     name: Optional[str] = None,
     force: bool = False,
     create_alias: bool = False,
+    subdir: str = "",
 ) -> InstallPlan:
     """Install a distribution from *source* into a new profile.
 
@@ -836,7 +1052,7 @@ def install_distribution(
     plan: Optional[InstallPlan] = None
     try:
         with tempfile.TemporaryDirectory(prefix="hermes_dist_install_") as tmp:
-            plan = plan_install(source, Path(tmp), override_name=name)
+            plan = plan_install(source, Path(tmp), override_name=name, subdir=subdir)
 
             if plan.existing and not force:
                 raise DistributionError(
@@ -863,9 +1079,12 @@ def install_distribution(
                 "profile_install",
                 strict=True,
                 name=plan.manifest.name,
-                source_url=_fragment_free_source_url(plan.provenance, plan.ref),
+                source_url=_fragment_free_source_url(
+                    plan.provenance, plan.ref, plan.subdir
+                ),
                 ref=plan.ref,
                 sha=plan.sha,
+                subdir=plan.subdir,
                 distribution_version=plan.manifest.version,
                 target_dir=str(plan.target_dir),
                 event="install",
@@ -874,21 +1093,27 @@ def install_distribution(
     except (DistributionError, ValueError) as e:
         if not isinstance(e, ProfileHookError):
             if plan is not None:
-                fail_source_url = _fragment_free_source_url(plan.provenance, plan.ref)
+                fail_source_url = _fragment_free_source_url(
+                    plan.provenance, plan.ref, plan.subdir
+                )
                 fail_ref = plan.ref
+                fail_subdir = plan.subdir
             else:
-                # Staging failed before plan_install() returned — split any
-                # trailing #<ref> off the raw source ourselves so the payload
-                # matches the success-path contract (fragment-free source_url,
-                # populated ref) instead of dumping the raw #ref-bearing
-                # string into source_url with an empty ref.
-                fail_source_url, fail_ref = _split_source_ref(source)
+                # Staging failed before plan_install() returned — split the
+                # raw source's fragment ourselves so the payload matches the
+                # success-path contract (fragment-free source_url, populated
+                # ref/subdir) instead of dumping the raw fragment-bearing
+                # string into source_url.
+                fail_source_url, fail_ref, fail_subdir = _split_source_for_hooks(
+                    source
+                )
             _fire_profile_lifecycle_hook(
                 "profile_install_failed",
                 strict=False,
                 name=plan.manifest.name if plan is not None else "",
                 source_url=fail_source_url,
                 ref=fail_ref,
+                subdir=fail_subdir,
                 error=str(e),
                 event="install_failed",
             )
@@ -962,9 +1187,12 @@ def update_distribution(
                 "profile_update",
                 strict=True,
                 name=plan.manifest.name,
-                source_url=_fragment_free_source_url(plan.provenance, plan.ref),
+                source_url=_fragment_free_source_url(
+                    plan.provenance, plan.ref, plan.subdir
+                ),
                 ref=plan.ref,
                 sha=plan.sha,
+                subdir=plan.subdir,
                 distribution_version=plan.manifest.version,
                 target_dir=str(plan.target_dir),
                 event="update",
@@ -975,19 +1203,25 @@ def update_distribution(
     except (DistributionError, ValueError) as e:
         if not isinstance(e, ProfileHookError):
             if plan is not None:
-                fail_source_url = _fragment_free_source_url(plan.provenance, plan.ref)
+                fail_source_url = _fragment_free_source_url(
+                    plan.provenance, plan.ref, plan.subdir
+                )
                 fail_ref = plan.ref
+                fail_subdir = plan.subdir
             else:
                 # Re-staging failed before plan_install() returned — split
-                # any trailing #<ref> off the recorded source ourselves, same
-                # rationale as the install_distribution() failure path above.
-                fail_source_url, fail_ref = _split_source_ref(existing_manifest.source)
+                # the recorded source's fragment ourselves, same rationale
+                # as the install_distribution() failure path above.
+                fail_source_url, fail_ref, fail_subdir = _split_source_for_hooks(
+                    existing_manifest.source
+                )
             _fire_profile_lifecycle_hook(
                 "profile_install_failed",
                 strict=False,
                 name=plan.manifest.name if plan is not None else canon,
                 source_url=fail_source_url,
                 ref=fail_ref,
+                subdir=fail_subdir,
                 error=str(e),
                 event="update_failed",
             )

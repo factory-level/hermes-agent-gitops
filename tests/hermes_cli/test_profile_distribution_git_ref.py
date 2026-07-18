@@ -37,6 +37,10 @@ from hermes_cli.profile_distribution import (
     read_manifest,
     update_distribution,
     write_manifest,
+    _parse_fragment,
+    _normalize_subdir,
+    _canonical_provenance,
+    plan_install,
 )
 
 
@@ -66,7 +70,9 @@ def _git(*args: str, cwd: Path) -> str:
     return result.stdout.strip()
 
 
-def _make_bare_repo(tmp_path: Path, name: str = "origin") -> SimpleNamespace:
+def _make_bare_repo(
+    tmp_path: Path, name: str = "origin", subdir: str = ""
+) -> SimpleNamespace:
     """Build a local bare git repo with two commits, a branch, and a tag.
 
     Layout:
@@ -92,8 +98,10 @@ def _make_bare_repo(tmp_path: Path, name: str = "origin") -> SimpleNamespace:
     _git("config", "user.email", "test@example.com", cwd=work)
     _git("config", "user.name", "Test", cwd=work)
 
-    (work / "SOUL.md").write_text("I am v1.\n")
-    write_manifest(work, DistributionManifest(name="gitdist", version="1.0.0"))
+    payload_root = work / subdir if subdir else work
+    payload_root.mkdir(parents=True, exist_ok=True)
+    (payload_root / "SOUL.md").write_text("I am v1.\n")
+    write_manifest(payload_root, DistributionManifest(name="gitdist", version="1.0.0"))
     _git("add", "-A", cwd=work)
     _git("commit", "-m", "v1", cwd=work)
     _git("push", "origin", "main", cwd=work)
@@ -101,7 +109,7 @@ def _make_bare_repo(tmp_path: Path, name: str = "origin") -> SimpleNamespace:
     _git("tag", "v1", cwd=work)
     _git("push", "origin", "v1", cwd=work)
 
-    (work / "SOUL.md").write_text("I am v2.\n")
+    (payload_root / "SOUL.md").write_text("I am v2.\n")
     _git("add", "-A", cwd=work)
     _git("commit", "-m", "v2", cwd=work)
     _git("push", "origin", "main", cwd=work)
@@ -212,7 +220,7 @@ class TestStageSourceGitRef:
 
     def test_no_ref_records_head_sha_and_empty_ref(self, tmp_path):
         info = _make_bare_repo(tmp_path)
-        staged, provenance, ref, sha = _stage_source(str(info.bare), tmp_path / "work1")
+        staged, provenance, ref, sha, _subdir = _stage_source(str(info.bare), tmp_path / "work1")
         assert provenance == str(info.bare)
         assert ref == ""
         assert sha == info.tip_sha
@@ -221,7 +229,7 @@ class TestStageSourceGitRef:
     def test_tag_ref_keeps_full_url_hash_ref_provenance(self, tmp_path):
         info = _make_bare_repo(tmp_path)
         source = f"{info.bare}#v1"
-        staged, provenance, ref, sha = _stage_source(source, tmp_path / "work2")
+        staged, provenance, ref, sha, _subdir = _stage_source(source, tmp_path / "work2")
         assert provenance == source  # url#ref preserved verbatim for `update`
         assert ref == "v1"
         assert sha == info.v1_sha
@@ -230,7 +238,7 @@ class TestStageSourceGitRef:
         staged_src = tmp_path / "localsrc"
         staged_src.mkdir()
         write_manifest(staged_src, DistributionManifest(name="local"))
-        staged, provenance, ref, sha = _stage_source(str(staged_src), tmp_path / "work3")
+        staged, provenance, ref, sha, _subdir = _stage_source(str(staged_src), tmp_path / "work3")
         assert ref == ""
         assert sha == ""
         assert provenance == str(staged_src.resolve())
@@ -241,7 +249,7 @@ class TestStageSourceGitRef:
         staged_src = tmp_path / "plainlocal"
         staged_src.mkdir()
         write_manifest(staged_src, DistributionManifest(name="plain"))
-        staged, provenance, ref, sha = _stage_source(str(staged_src), tmp_path / "work4")
+        staged, provenance, ref, sha, _subdir = _stage_source(str(staged_src), tmp_path / "work4")
         assert staged == staged_src.resolve()
         assert ref == "" and sha == ""
 
@@ -395,3 +403,167 @@ class TestManifestRefShaRoundtrip:
         m = DistributionManifest.from_dict({"name": "x"})
         assert m.installed_ref == ""
         assert m.installed_sha == ""
+
+
+# ===========================================================================
+# Subdirectory distributions (source fragment + --subdir flag)
+# ===========================================================================
+
+
+class TestParseFragment:
+    @pytest.mark.parametrize(
+        ("fragment", "expected"),
+        [
+            ("", ("", "")),
+            ("v1", ("v1", "")),
+            ("subdirectory=.hermes-dist", ("", ".hermes-dist")),
+            ("v1&subdirectory=agents/bot", ("v1", "agents/bot")),
+            ("a&b", ("a&b", "")),  # ref with a literal '&' survives
+            ("a&b&subdirectory=x", ("a&b", "x")),
+        ],
+    )
+    def test_shapes(self, fragment, expected):
+        assert _parse_fragment(fragment) == expected
+
+    def test_empty_subdirectory_value_rejected(self):
+        with pytest.raises(DistributionError, match="Empty subdirectory="):
+            _parse_fragment("v1&subdirectory=")
+
+    def test_duplicate_subdirectory_params_rejected(self):
+        with pytest.raises(DistributionError, match="Multiple subdirectory="):
+            _parse_fragment("v1&subdirectory=a&subdirectory=b")
+
+
+class TestNormalizeSubdir:
+    @pytest.mark.parametrize(
+        ("raw", "clean"),
+        [
+            ("agents/bot", "agents/bot"),
+            ("./x/", "x"),
+            (".hermes-dist", ".hermes-dist"),
+            ("a/./b", "a/b"),
+        ],
+    )
+    def test_accepts_and_cleans(self, raw, clean):
+        assert _normalize_subdir(raw) == clean
+
+    @pytest.mark.parametrize("raw", ["/abs", "../x", "a/../b", "a\\b", "", "."])
+    def test_rejects(self, raw):
+        with pytest.raises(DistributionError, match="Invalid distribution subdirectory"):
+            _normalize_subdir(raw)
+
+
+class TestStageSourceSubdir:
+    SUB = "agents/bot"
+
+    def test_fragment_subdir_at_tag(self, tmp_path):
+        info = _make_bare_repo(tmp_path, subdir=self.SUB)
+        source = f"{info.bare}#v1&subdirectory={self.SUB}"
+        staged, provenance, ref, sha, subdir = _stage_source(source, tmp_path / "w1")
+        assert (staged / MANIFEST_FILENAME).is_file()
+        assert staged.name == "bot"
+        assert (ref, sha, subdir) == ("v1", info.v1_sha, self.SUB)
+        assert provenance == source
+
+    def test_fragment_subdir_no_ref(self, tmp_path):
+        info = _make_bare_repo(tmp_path, subdir=self.SUB)
+        source = f"{info.bare}#subdirectory={self.SUB}"
+        staged, provenance, ref, sha, subdir = _stage_source(source, tmp_path / "w2")
+        assert (staged / MANIFEST_FILENAME).is_file()
+        assert (ref, sha, subdir) == ("", info.tip_sha, self.SUB)
+        assert provenance == source
+
+    def test_flag_subdir_canonicalizes_provenance(self, tmp_path):
+        info = _make_bare_repo(tmp_path, subdir=self.SUB)
+        staged, provenance, ref, sha, subdir = _stage_source(
+            str(info.bare), tmp_path / "w3", subdir=self.SUB
+        )
+        assert (staged / MANIFEST_FILENAME).is_file()
+        assert provenance == f"{info.bare}#subdirectory={self.SUB}"
+
+    def test_flag_plus_tag_canonicalizes_provenance(self, tmp_path):
+        info = _make_bare_repo(tmp_path, subdir=self.SUB)
+        staged, provenance, ref, sha, subdir = _stage_source(
+            f"{info.bare}#v1", tmp_path / "w4", subdir=self.SUB
+        )
+        assert provenance == f"{info.bare}#v1&subdirectory={self.SUB}"
+        assert sha == info.v1_sha
+
+    def test_flag_vs_fragment_conflict_fails_naming_both(self, tmp_path):
+        info = _make_bare_repo(tmp_path, subdir=self.SUB)
+        with pytest.raises(DistributionError, match="Conflicting subdirectories"):
+            _stage_source(
+                f"{info.bare}#subdirectory={self.SUB}", tmp_path / "w5", subdir="other"
+            )
+
+    def test_flag_equal_to_fragment_ok(self, tmp_path):
+        info = _make_bare_repo(tmp_path, subdir=self.SUB)
+        _, provenance, _, _, subdir = _stage_source(
+            f"{info.bare}#subdirectory={self.SUB}", tmp_path / "w6", subdir=self.SUB
+        )
+        assert subdir == self.SUB
+
+    def test_missing_subdir_names_it(self, tmp_path):
+        info = _make_bare_repo(tmp_path)
+        with pytest.raises(DistributionError, match="does not exist"):
+            _stage_source(
+                f"{info.bare}#subdirectory=nope/where", tmp_path / "w7"
+            )
+
+    def test_subdir_without_manifest_names_exact_path(self, tmp_path):
+        info = _make_bare_repo(tmp_path)  # manifest at ROOT, not in sub
+        # Create a real (manifest-less) subdir in a new commit
+        (info.work / "empty-sub").mkdir()
+        (info.work / "empty-sub" / "keep.txt").write_text("x\n")
+        _git("add", "-A", cwd=info.work)
+        _git("commit", "-m", "sub", cwd=info.work)
+        _git("push", "origin", "main", cwd=info.work)
+        with pytest.raises(
+            DistributionError, match=r"empty-sub/distribution\.yaml"
+        ):
+            _stage_source(f"{info.bare}#subdirectory=empty-sub", tmp_path / "w8")
+
+    @pytest.mark.parametrize("bad", ["../x", "/abs", "a\\b"])
+    def test_escape_rejected_before_clone(self, tmp_path, bad):
+        workdir = tmp_path / "w9"
+        with pytest.raises(DistributionError, match="Invalid distribution subdirectory"):
+            _stage_source(
+                f"https://example.invalid/repo.git#subdirectory={bad}", workdir
+            )
+        assert not (workdir / "clone").exists(), "validation must precede the clone"
+
+
+class TestUpdateRePinsSubdir:
+    SUB = "agents/bot"
+
+    def test_branch_pinned_subdir_follows_moved_tip(self, tmp_path, profile_env):
+        info = _make_bare_repo(tmp_path, subdir=self.SUB)
+        source = f"{info.bare}#main&subdirectory={self.SUB}"
+        plan = install_distribution(source, name="subdist")
+        assert plan.manifest.source == source
+        assert plan.subdir == self.SUB
+
+        # Move the branch tip: bump the nested manifest version.
+        payload = info.work / self.SUB
+        write_manifest(
+            payload, DistributionManifest(name="gitdist", version="2.0.0")
+        )
+        _git("add", "-A", cwd=info.work)
+        _git("commit", "-m", "v2 manifest", cwd=info.work)
+        _git("push", "origin", "main", cwd=info.work)
+        moved_sha = _git("rev-parse", "HEAD", cwd=info.work)
+
+        updated = update_distribution("subdist")
+        assert updated.manifest.version == "2.0.0"
+        assert updated.sha == moved_sha
+        assert updated.manifest.source == source  # provenance unchanged
+        assert updated.subdir == self.SUB
+
+    def test_tag_pinned_subdir_stays_fixed(self, tmp_path, profile_env):
+        info = _make_bare_repo(tmp_path, subdir=self.SUB)
+        source = f"{info.bare}#v1&subdirectory={self.SUB}"
+        plan = install_distribution(source, name="subdist2")
+        assert plan.sha == info.v1_sha
+        updated = update_distribution("subdist2")
+        assert updated.sha == info.v1_sha
+        assert updated.manifest.source == source

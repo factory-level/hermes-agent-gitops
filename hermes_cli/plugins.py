@@ -221,13 +221,20 @@ VALID_HOOKS: Set[str] = {
     # CLI preview-gate note).
     #
     # Kwargs for profile_install / profile_update:
-    #   name: str, source_url: str, ref: str, sha: str,
+    #   name: str, source_url: str, ref: str, sha: str, subdir: str,
     #   distribution_version: str, target_dir: str, event: "install" | "update"
+    #   (subdir: subdirectory of the source repo containing the
+    #   distribution; "" when it sits at the repo root or the recorded
+    #   local source already points directly at the subtree.)
     # profile_update adds: previous_version: str, previous_sha: str.
     # Kwargs for profile_install_failed:
     #   name: str (may be "" if staging failed before name resolution),
-    #   source_url: str, ref: str, error: str,
+    #   source_url: str, ref: str, subdir: str (best-effort), error: str,
     #   event: "install_failed" | "update_failed"
+    # Callbacks should accept **kwargs for forward compatibility: new
+    # kwargs are added over time, and invoke_hook() swallows a strict
+    # signature's TypeError — the callback silently stops receiving
+    # events rather than crashing the install.
     #
     # Observers by default: return None. A callback may return
     #   {"error": str, "fatal": True, "plugin": str}

@@ -811,3 +811,62 @@ class TestErrorSurfaces:
         staged = _make_staging_dir(profile_env, "bad", manifest=mf)
         with pytest.raises((ValueError, DistributionError)):
             plan_install(str(staged), tmp_path / "work")
+
+
+class TestLocalSubdirInstall:
+    """Local-directory sources with the distribution in a subdirectory
+    (issue: subdir distributions — --subdir flag + fragment form)."""
+
+    def _make_repo_with_nested_dist(self, root: Path, subdir: str = "dist/agent") -> Path:
+        repo = root / "monorepo"
+        nested = repo / subdir
+        nested.mkdir(parents=True)
+        (repo / "README.md").write_text("not part of the distribution\n")
+        (nested / "SOUL.md").write_text("nested soul\n")
+        write_manifest(nested, DistributionManifest(name="nested", version="0.1.0"))
+        return repo
+
+    def test_flag_installs_from_subdir(self, profile_env):
+        repo = self._make_repo_with_nested_dist(profile_env)
+        plan = install_distribution(str(repo), subdir="dist/agent")
+        assert (plan.target_dir / "SOUL.md").read_text() == "nested soul\n"
+        # README.md at the repo root is NOT part of the payload
+        assert not (plan.target_dir / "README.md").exists()
+        # Local provenance = the resolved subtree, no fragment - and the
+        # reported subdir is "" to match (source already IS the dist root;
+        # (source, subdir) must compose without double-descent).
+        assert plan.manifest.source == str((repo / "dist/agent").resolve())
+        assert plan.subdir == ""
+
+    def test_fragment_installs_from_subdir_when_literal_path_missing(self, profile_env):
+        repo = self._make_repo_with_nested_dist(profile_env)
+        plan = install_distribution(f"{repo}#subdirectory=dist/agent", name="fragged")
+        assert (plan.target_dir / "SOUL.md").read_text() == "nested soul\n"
+        assert plan.manifest.source == str((repo / "dist/agent").resolve())
+
+    def test_literal_dir_with_hash_in_name_still_wins(self, profile_env):
+        weird = profile_env / "mydir#weird"
+        weird.mkdir()
+        (weird / "SOUL.md").write_text("weird soul\n")
+        write_manifest(weird, DistributionManifest(name="weird", version="0.1.0"))
+        plan = install_distribution(str(weird))
+        assert (plan.target_dir / "SOUL.md").read_text() == "weird soul\n"
+        assert plan.subdir == ""
+
+    def test_subdir_without_manifest_names_exact_path(self, profile_env):
+        repo = self._make_repo_with_nested_dist(profile_env)
+        (repo / "empty").mkdir()
+        with pytest.raises(DistributionError, match=r"empty"):
+            install_distribution(str(repo), name="x", subdir="empty")
+
+    def test_update_round_trips_subtree_provenance(self, profile_env):
+        repo = self._make_repo_with_nested_dist(profile_env)
+        plan = install_distribution(str(repo), subdir="dist/agent")
+        # Bump the nested distribution and update by profile name.
+        nested = repo / "dist/agent"
+        write_manifest(nested, DistributionManifest(name="nested", version="0.2.0"))
+        updated = update_distribution("nested")
+        assert updated.manifest.version == "0.2.0"
+        # Provenance stays the subtree path; update's re-stage saw it as root.
+        assert updated.manifest.source == plan.manifest.source
+        assert updated.subdir == ""

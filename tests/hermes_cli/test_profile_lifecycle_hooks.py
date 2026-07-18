@@ -110,6 +110,7 @@ def test_install_fires_profile_install_with_full_payload(profile_env, hook_regis
     assert kw["source_url"] == str(staged.resolve())
     assert kw["ref"] == ""
     assert kw["sha"] == ""
+    assert kw["subdir"] == ""
     assert kw["distribution_version"] == "0.1.0"
     assert kw["target_dir"] == str(plan.target_dir)
     assert kw["event"] == "install"
@@ -455,3 +456,70 @@ def test_require_emitter_with_subscriber_returning_none_succeeds(
     plan = install_distribution(str(staged))  # must not raise
 
     assert plan.target_dir.is_dir()
+
+
+def test_failed_install_with_ref_and_subdir_splits_all_three(
+    profile_env, hook_registry, tmp_path
+):
+    """A ``url#ref&subdirectory=path`` source that fails during staging must
+    produce a fragment-free ``source_url`` + populated ``ref`` AND ``subdir``
+    in the ``profile_install_failed`` payload — the success-payload shape."""
+    events = []
+    _capture(hook_registry, "profile_install_failed", events)
+
+    bogus_repo = tmp_path / "does_not_exist.git"
+    source = f"{bogus_repo}#main&subdirectory=x"
+
+    with pytest.raises(Exception):
+        install_distribution(source)
+
+    fired = [e for e in events if e[0] == "profile_install_failed"]
+    assert len(fired) == 1
+    kw = fired[0][1]
+    assert kw["source_url"] == str(bogus_repo)
+    assert kw["ref"] == "main"
+    assert kw["subdir"] == "x"
+    assert kw["event"] == "install_failed"
+
+
+def test_subdir_install_fires_hook_with_subdir_and_fragment_free_source(
+    profile_env, hook_registry, tmp_path
+):
+    """A git subdir install's ``profile_install`` payload carries the subdir
+    and a source_url with the whole fragment stripped."""
+    import subprocess
+
+    events = []
+    _capture(hook_registry, "profile_install", events)
+
+    bare = tmp_path / "srv.git"
+    subprocess.run(
+        ["git", "init", "--bare", "-b", "main", str(bare)],
+        check=True, capture_output=True,
+    )
+    work = tmp_path / "srv_work"
+    subprocess.run(
+        ["git", "clone", str(bare), str(work)], check=True, capture_output=True
+    )
+    for args in (
+        ["config", "user.email", "t@example.com"],
+        ["config", "user.name", "T"],
+    ):
+        subprocess.run(["git", "-C", str(work), *args], check=True, capture_output=True)
+    payload = work / "agents" / "bot"
+    payload.mkdir(parents=True)
+    (payload / "SOUL.md").write_text("nested soul\n")
+    write_manifest(payload, DistributionManifest(name="nested", version="0.1.0"))
+    for args in (["add", "-A"], ["commit", "-m", "c1"], ["push", "origin", "main"]):
+        subprocess.run(["git", "-C", str(work), *args], check=True, capture_output=True)
+
+    plan = install_distribution(f"{bare}#main&subdirectory=agents/bot")
+
+    fired = [e for e in events if e[0] == "profile_install"]
+    assert len(fired) == 1
+    kw = fired[0][1]
+    assert kw["subdir"] == "agents/bot"
+    assert kw["source_url"] == str(bare)
+    assert kw["ref"] == "main"
+    assert "#" not in kw["source_url"]
+    assert (plan.target_dir / "SOUL.md").read_text() == "nested soul\n"
