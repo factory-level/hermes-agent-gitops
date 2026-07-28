@@ -331,6 +331,59 @@ def cron_create(args):
     return 0
 
 
+def cron_sync(args):
+    """Converge cron declarations shipped by this profile's distribution.
+
+    The interesting part of the output is the pause: a freshly synced job is
+    listed but not scheduled, because a container restart must never re-arm
+    something an operator stopped. Print the resume command so the next step is
+    obvious rather than something to go looking for.
+    """
+    from hermes_cli.cron_sync import CronDeclarationError, declaration_dir, sync
+
+    want_json = bool(getattr(args, "json_output", False))
+    dry_run = bool(getattr(args, "dry_run", False))
+
+    try:
+        report = sync(dry_run=dry_run)
+    except CronDeclarationError as exc:
+        if want_json:
+            print(json.dumps({"error": str(exc)}, indent=2))
+        else:
+            print(color(f"Cron declaration error: {exc}", Colors.RED))
+        return 1
+
+    if want_json:
+        print(json.dumps(report, indent=2))
+        return 0
+
+    changed = report["created"] + report["updated"] + report["pruned"]
+    if not changed and not report["unchanged"]:
+        print(f"No cron declarations in {declaration_dir()}")
+        print("  A distribution ships them as cron/<job>.yaml; nothing to converge.")
+        return 0
+
+    prefix = "Would " if dry_run else ""
+    for entry in report["created"]:
+        verb = "create" if dry_run else "Created"
+        print(color(f"{prefix}{verb} {entry['name']}", Colors.GREEN) + f"  ({entry['schedule']}, from {entry['source']})")
+    for entry in report["updated"]:
+        verb = "update" if dry_run else "Updated"
+        print(color(f"{prefix}{verb} {entry['name']}", Colors.YELLOW) + f"  (from {entry['source']})")
+    for entry in report["pruned"]:
+        verb = "remove" if dry_run else "Removed"
+        print(color(f"{prefix}{verb} {entry['name']}", Colors.RED) + "  (declaration is gone)")
+    for entry in report["unchanged"]:
+        print(f"  {entry['name']} unchanged")
+
+    if report["created"] and not dry_run:
+        print()
+        print("New jobs are PAUSED so a redeploy never starts work on its own.")
+        print("  Review:  hermes cron list --all")
+        print("  Enable:  hermes cron resume <name>")
+    return 0
+
+
 def cron_edit(args):
     from cron.jobs import AmbiguousJobReference, resolve_job_ref
 
@@ -436,6 +489,9 @@ def cron_command(args):
     if subcmd in {"create", "add"}:
         return cron_create(args)
 
+    if subcmd == "sync":
+        return cron_sync(args)
+
     if subcmd == "edit":
         return cron_edit(args)
 
@@ -452,5 +508,5 @@ def cron_command(args):
         return _job_action("remove", args.job_id, "Removed")
 
     print(f"Unknown cron command: {subcmd}")
-    print("Usage: hermes cron [list|create|edit|pause|resume|run|remove|status|tick]")
+    print("Usage: hermes cron [list|create|sync|edit|pause|resume|run|remove|status|tick]")
     sys.exit(1)
