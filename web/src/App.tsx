@@ -102,7 +102,15 @@ import { isDashboardEmbeddedChatEnabled } from "@/lib/dashboard-flags";
 import { api } from "@/lib/api";
 import type { StatusResponse, UpdateCheckResponse } from "@/lib/api";
 
-function RootRedirect() {
+function RootRedirect({ pluginsLoading }: { pluginsLoading: boolean }) {
+  // Waiting on `pluginsLoading` is load-bearing, exactly as it is for
+  // UnknownRouteFallback below: manifests arrive asynchronously, and a
+  // plugin overriding "/" (tab.override) only swaps the route AFTER they
+  // resolve. Without the gate, a cold hit of "/" fires this redirect
+  // first and the override page is unreachable at its own path.
+  if (pluginsLoading) {
+    return null;
+  }
   return <Navigate to="/sessions" replace />;
 }
 
@@ -131,7 +139,8 @@ const CHAT_NAV_ITEM: NavItem = {
  * and nav highlight keep working.
  */
 const BUILTIN_ROUTES_CORE: Record<string, ComponentType> = {
-  "/": RootRedirect,
+  // "/" is injected per-render in App() so RootRedirect can see
+  // pluginsLoading (see builtinRoutes below).
   "/sessions": SessionsPage,
   "/files": FilesPage,
   "/analytics": AnalyticsPage,
@@ -421,9 +430,12 @@ export default function App() {
   const builtinRoutes = useMemo(
     () => ({
       ...BUILTIN_ROUTES_CORE,
+      "/": function Root() {
+        return <RootRedirect pluginsLoading={pluginsLoading} />;
+      },
       ...(embeddedChat ? { "/chat": ChatRouteSink } : {}),
     }),
-    [embeddedChat],
+    [embeddedChat, pluginsLoading],
   );
 
   const builtinNav = useMemo(() => {
