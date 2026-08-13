@@ -277,6 +277,39 @@ class GatewayAuthorizationMixin:
         return getattr(self, "pairing_store", None)
 
     def _is_user_authorized(self, source: SessionSource) -> bool:
+        """Authorization verdict plus, on denial, one lifecycle record.
+
+        The record (hermes-gitops #476) makes a refusal OBSERVABLE instead
+        of a silent drop: gateway plane, outcome refused, the platform and
+        a redacted actor reference (id only, never message content). Every
+        caller funnels through here, so instrumenting the wrapper covers
+        them all; the verdict logic itself is unchanged in
+        ``_is_user_authorized_inner``. Free when HERMES_OBSERVER_URL is
+        unset; never raises into the authz path.
+        """
+        allowed = self._is_user_authorized_inner(source)
+        if not allowed:
+            try:
+                import hermes_lifecycle
+
+                hermes_lifecycle.emit(
+                    "gateway",
+                    "gateway.message.refused",
+                    outcome="refused",
+                    source={
+                        "kind": source.platform.value if source.platform else "unknown",
+                        "ref": str(source.user_id or "")[:64],
+                    },
+                    detail={
+                        "platform": source.platform.value if source.platform else "unknown",
+                        "chatType": str(source.chat_type or ""),
+                    },
+                )
+            except Exception:
+                pass
+        return allowed
+
+    def _is_user_authorized_inner(self, source: SessionSource) -> bool:
         """
         Check if a user is authorized to use the bot.
         

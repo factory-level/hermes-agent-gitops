@@ -165,6 +165,16 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
 
     cron_resume = cron_subparsers.add_parser("resume", help="Resume a paused job")
     cron_resume.add_argument("job_id", help="Job ID to resume")
+    cron_resume.add_argument(
+        "--until",
+        default=None,
+        help=(
+            "ISO-8601 deadline making this a TEMPORARY enablement: the "
+            "scheduler re-pauses the job once the deadline passes "
+            "(hermes-gitops #476). Omit for a normal resume, which also "
+            "clears any previous deadline."
+        ),
+    )
 
     cron_run = cron_subparsers.add_parser(
         "run", help="Run a job on the next scheduler tick"
