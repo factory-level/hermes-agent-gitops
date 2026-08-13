@@ -1464,30 +1464,45 @@ def resume_job(job_id: str, until: Optional[str] = None) -> Optional[Dict[str, A
 def expire_temporary_enablements() -> int:
     """Re-pause every job whose temporary enablement deadline has passed.
 
-    Called from the scheduler's tick, under its lock. Returns how many
-    jobs were paused. The pause reason names the mechanism so `cron list`
-    explains itself, and the pause emits the same cron.disabled record a
-    manual pause would - an expiry is a state change, not a silence.
+    Called from the scheduler's tick. Returns how many jobs were paused.
+    The pause reason names the mechanism so `cron list` explains itself,
+    and the expiry emits the same cron.disabled record a manual pause
+    would - an expiry is a state change, not a silence.
+
+    ONE load-modify-save transaction under the jobs lock (Codex catch):
+    the tick lock only excludes other ticks, and a two-step
+    clear-then-pause raced a concurrent explicit resume - the stale
+    expiry decision could overwrite a fresh enablement. Re-checking the
+    deadline inside the lock makes the race impossible.
     """
-    expired = 0
+    expired_jobs = []
     now = _hermes_now()
-    for job in load_jobs():
-        deadline = job.get("resume_until")
-        if not deadline or not job.get("enabled", False):
-            continue
-        from datetime import datetime
-        try:
-            deadline_dt = datetime.fromisoformat(str(deadline))
-        except ValueError:
-            continue  # malformed deadline: leave the job alone, visibly odd in list
-        if deadline_dt.tzinfo is None:
-            deadline_dt = deadline_dt.replace(tzinfo=now.tzinfo)
-        if deadline_dt <= now:
-            update_job(job["id"], {"resume_until": None})
-            paused = pause_job(job["id"], reason=f"temporary enablement expired at {deadline}")
-            if paused:
-                expired += 1
-    return expired
+    from datetime import datetime
+
+    with _jobs_lock():
+        jobs = load_jobs()
+        for job in jobs:
+            deadline = job.get("resume_until")
+            if not deadline or not job.get("enabled", False):
+                continue
+            try:
+                deadline_dt = datetime.fromisoformat(str(deadline))
+            except ValueError:
+                continue  # malformed deadline: leave the job alone, visibly odd in list
+            if deadline_dt.tzinfo is None:
+                deadline_dt = deadline_dt.replace(tzinfo=now.tzinfo)
+            if deadline_dt <= now:
+                job["enabled"] = False
+                job["state"] = "paused"
+                job["paused_at"] = now.isoformat()
+                job["paused_reason"] = f"temporary enablement expired at {deadline}"
+                job["resume_until"] = None
+                expired_jobs.append(job)
+        if expired_jobs:
+            _save_jobs_unlocked(jobs)
+    for job in expired_jobs:
+        _lifecycle_emit("cron.disabled", job)
+    return len(expired_jobs)
 
 
 def trigger_job(job_id: str) -> Optional[Dict[str, Any]]:

@@ -172,47 +172,56 @@ def emit(
     unconditionally instead of branching on whether observability is on.
     """
     record_id = str(uuid.uuid4())
-    ambient = _current_trace.get()
-    if trace_id is None and ambient:
-        trace_id = ambient["traceId"]
-        if causation_id is None:
-            causation_id = ambient.get("causationId")
-    tid = trace_id or str(uuid.uuid4())
-    if not _observer_url():
-        return {"recordId": record_id, "traceId": tid}
-    if plane not in _PLANES:
-        return {"recordId": record_id, "traceId": tid}
-    record: Dict[str, Any] = {
-        "version": 1,
-        "recordId": record_id,
-        "traceId": tid,
-        "plane": plane,
-        "type": type_,
-        "occurredAt": datetime.now(timezone.utc).isoformat(),
-    }
-    if causation_id:
-        record["causationId"] = causation_id
-    if correlation_id:
-        record["correlationId"] = correlation_id
-    if outcome:
-        record["outcome"] = outcome
-    if duration_ms is not None:
-        record["durationMs"] = round(float(duration_ms), 1)
-    if profile:
-        record["profile"] = str(profile)[:80]
-    if test_run:
-        record["testRun"] = str(test_run)[:80]
-    if source:
-        record["redactedSource"] = {k: str(v)[:120] for k, v in source.items() if k in ("kind", "ref", "label")}
-    if target:
-        record["redactedTarget"] = {k: str(v)[:120] for k, v in target.items() if k in ("kind", "ref", "label")}
-    scalars = _scalar_detail(detail)
-    if scalars:
-        record["detail"] = scalars
-    _ensure_worker()
+    tid = trace_id or ""
+    # EVERYTHING below is fail-closed (Codex catch): the never-raises
+    # contract is what lets call sites instrument hot paths unguarded,
+    # so a Thread.start() failure, a hostile __str__ in detail, or any
+    # other surprise must degrade to "no record", never into the job or
+    # tool being narrated.
     try:
-        _queue.put_nowait(record)
-    except queue.Full:
-        global _dropped
-        _dropped += 1
-    return {"recordId": record_id, "traceId": tid}
+        ambient = _current_trace.get()
+        if trace_id is None and ambient:
+            trace_id = ambient["traceId"]
+            if causation_id is None:
+                causation_id = ambient.get("causationId")
+        tid = trace_id or str(uuid.uuid4())
+        if not _observer_url():
+            return {"recordId": record_id, "traceId": tid}
+        if plane not in _PLANES:
+            return {"recordId": record_id, "traceId": tid}
+        record: Dict[str, Any] = {
+            "version": 1,
+            "recordId": record_id,
+            "traceId": tid,
+            "plane": plane,
+            "type": type_,
+            "occurredAt": datetime.now(timezone.utc).isoformat(),
+        }
+        if causation_id:
+            record["causationId"] = causation_id
+        if correlation_id:
+            record["correlationId"] = correlation_id
+        if outcome:
+            record["outcome"] = outcome
+        if duration_ms is not None:
+            record["durationMs"] = round(float(duration_ms), 1)
+        if profile:
+            record["profile"] = str(profile)[:80]
+        if test_run:
+            record["testRun"] = str(test_run)[:80]
+        if source:
+            record["redactedSource"] = {k: str(v)[:120] for k, v in source.items() if k in ("kind", "ref", "label")}
+        if target:
+            record["redactedTarget"] = {k: str(v)[:120] for k, v in target.items() if k in ("kind", "ref", "label")}
+        scalars = _scalar_detail(detail)
+        if scalars:
+            record["detail"] = scalars
+        _ensure_worker()
+        try:
+            _queue.put_nowait(record)
+        except queue.Full:
+            global _dropped
+            _dropped += 1
+    except Exception:
+        pass
+    return {"recordId": record_id, "traceId": tid or str(uuid.uuid4())}

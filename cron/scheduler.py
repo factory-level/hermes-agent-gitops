@@ -3587,6 +3587,12 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         "cron", "cron.triggered", profile=_profile, test_run=_test_run, detail=_job_detail
     )
     _run_started_at = time.monotonic()
+    # BaseException-safe: the ambient trace token must reset even on
+    # KeyboardInterrupt/SystemExit, because pool worker threads are
+    # REUSED and a leaked token bleeds this firing's trace into the next
+    # job's records (Codex catch). reset_current_trace is idempotent, so
+    # the success path's early reset plus this finally is safe.
+    _trace_token = None
     try:
         # Pre-run dispatch claim (issue #38758): atomically commit a finite
         # one-shot's dispatch BEFORE its side effect runs, so a tick that dies
@@ -3672,13 +3678,6 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             profile=_profile, test_run=_test_run, detail=_job_detail,
         )
         _lc.reset_current_trace(_trace_token)
-        _done = _lc.emit(
-            "cron", "cron.completed" if success else "cron.failed",
-            trace_id=_trig["traceId"], causation_id=_start["recordId"],
-            outcome="success" if success else "failure",
-            duration_ms=(time.monotonic() - _run_started_at) * 1000.0,
-            profile=_profile, test_run=_test_run, detail=_job_detail,
-        )
         delivery_error = None
         try:
             output_file = save_job_output(job["id"], output)
@@ -3720,7 +3719,7 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             if should_deliver:
                 _dstart = _lc.emit(
                     "cron", "cron.delivery.started", trace_id=_trig["traceId"],
-                    causation_id=_done["recordId"], profile=_profile,
+                    causation_id=_start["recordId"], profile=_profile,
                     test_run=_test_run, detail=_job_detail,
                 )
                 try:
@@ -3752,16 +3751,25 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             success = False
             error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
+        # The TERMINAL cron record, emitted beside mark_job_run and after
+        # every fact that can flip the verdict (empty-response guard,
+        # interruption, delivery) - a cron.completed followed by a
+        # contradictory cron.failed is worse than a late record (Codex
+        # catch). Delivery has its own sub-chain above; this is the run's
+        # verdict.
+        _lc.emit(
+            "cron", "cron.completed" if success else "cron.failed",
+            trace_id=_trig["traceId"], causation_id=_start["recordId"],
+            outcome="success" if success else "failure",
+            duration_ms=(time.monotonic() - _run_started_at) * 1000.0,
+            profile=_profile, test_run=_test_run, detail=_job_detail,
+        )
         if not _consume_interrupted_flag(job["id"]):
             mark_job_run(job["id"], success, error, delivery_error=delivery_error)
         return True
 
     except Exception as e:
         logger.error("Error processing job %s: %s", job['id'], e)
-        try:
-            _lc.reset_current_trace(_trace_token)
-        except NameError:
-            pass  # raised before the trace scope was installed
         _lc.emit(
             "cron", "cron.failed", trace_id=_trig["traceId"],
             causation_id=_trig["recordId"], outcome="failure",
@@ -3771,6 +3779,9 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         if not _consume_interrupted_flag(job["id"]):
             mark_job_run(job["id"], False, str(e))
         return False
+    finally:
+        if _trace_token is not None:
+            _lc.reset_current_trace(_trace_token)
 
 
 def _notify_provider_jobs_changed() -> None:
