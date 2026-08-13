@@ -448,8 +448,11 @@ def cron_edit(args):
     return 0
 
 
-def _job_action(action: str, job_id: str, success_verb: str) -> int:
-    result = _cron_api(action=action, job_id=job_id)
+def _job_action(action: str, job_id: str, success_verb: str, until: str = None) -> int:
+    kwargs = {"action": action, "job_id": job_id}
+    if until:
+        kwargs["until"] = until
+    result = _cron_api(**kwargs)
     if not result.get("success"):
         print(color(f"Failed to {action} job: {result.get('error', 'unknown error')}", Colors.RED))
         return 1
@@ -499,7 +502,9 @@ def cron_command(args):
         return _job_action("pause", args.job_id, "Paused")
 
     if subcmd == "resume":
-        return _job_action("resume", args.job_id, "Resumed")
+        return _job_action(
+            "resume", args.job_id, "Resumed", until=getattr(args, "until", None)
+        )
 
     if subcmd == "run":
         return _job_action("run", args.job_id, "Triggered")
