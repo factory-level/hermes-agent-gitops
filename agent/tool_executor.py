@@ -310,51 +310,23 @@ def _run_agent_tool_execution_middleware(
 
     from hermes_cli.middleware import run_tool_execution_middleware
 
-    # Lifecycle records (hermes-gitops #476): every tool execution path
-    # funnels through this ONE function, which is why the tool plane is
-    # instrumented here and nowhere else. Metadata only - the tool NAME,
-    # never its arguments or result; free when HERMES_OBSERVER_URL is
-    # unset; joins the ambient trace (the enclosing cron/agent run) via
-    # hermes_lifecycle's contextvar, which the executor's contextvar
-    # propagation carries into concurrent tool workers.
-    import time as _time
-
-    import hermes_lifecycle as _lc
-
-    _tool_detail = {"tool": str(function_name)[:80]}
-    _started = _lc.emit("tool", "tool.started", detail=_tool_detail)
-    _t0 = _time.monotonic()
-    try:
-        result = run_tool_execution_middleware(
-            function_name,
-            function_args,
-            _execute,
-            original_args=function_args,
-            task_id=effective_task_id or "",
-            session_id=getattr(agent, "session_id", "") or "",
-            tool_call_id=tool_call_id or "",
-            turn_id=getattr(agent, "_current_turn_id", "") or "",
-            api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-        )
-    except BaseException:
-        _lc.emit(
-            "tool",
-            "tool.failed",
-            trace_id=_started["traceId"],
-            causation_id=_started["recordId"],
-            outcome="failure",
-            duration_ms=(_time.monotonic() - _t0) * 1000.0,
-            detail=_tool_detail,
-        )
-        raise
-    _lc.emit(
-        "tool",
-        "tool.completed",
-        trace_id=_started["traceId"],
-        causation_id=_started["recordId"],
-        outcome="success",
-        duration_ms=(_time.monotonic() - _t0) * 1000.0,
-        detail=_tool_detail,
+    # Tool-plane lifecycle records are emitted INSIDE
+    # run_tool_execution_middleware (hermes-gitops #476): the live proof
+    # showed this helper is NOT the single funnel - invoke_tool
+    # (agent_runtime_helpers.py) calls the middleware module directly on
+    # the concurrent path, so instrumenting here missed every concurrent
+    # tool call. The middleware function itself is the one seam both
+    # paths share.
+    result = run_tool_execution_middleware(
+        function_name,
+        function_args,
+        _execute,
+        original_args=function_args,
+        task_id=effective_task_id or "",
+        session_id=getattr(agent, "session_id", "") or "",
+        tool_call_id=tool_call_id or "",
+        turn_id=getattr(agent, "_current_turn_id", "") or "",
+        api_request_id=getattr(agent, "_current_api_request_id", "") or "",
     )
     return result, observed_args
 
