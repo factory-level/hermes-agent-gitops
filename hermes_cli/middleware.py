@@ -195,19 +195,49 @@ def run_tool_execution_middleware(
     next_call: Callable[[Dict[str, Any]], Any],
     **context: Any,
 ) -> Any:
-    """Run tool execution through registered tool execution middleware."""
-    callbacks = _get_middleware_callbacks(TOOL_EXECUTION_MIDDLEWARE)
-    if not callbacks:
-        return next_call(args)
-    return _run_execution_chain(
-        TOOL_EXECUTION_MIDDLEWARE,
-        callbacks,
-        next_call,
-        tool_name=tool_name,
-        args=args,
-        original_args=context.pop("original_args", args),
-        **context,
+    """Run tool execution through registered tool execution middleware.
+
+    This function is the ONE seam every tool execution passes through -
+    both the sequential helper and invoke_tool's direct call - which is
+    why the tool-plane lifecycle records (hermes-gitops #476) are
+    emitted here. Metadata only (the tool NAME, never args or results);
+    hermes_lifecycle is free when HERMES_OBSERVER_URL is unset and can
+    never raise into the execution it narrates.
+    """
+    import time as _time
+
+    import hermes_lifecycle as _lc
+
+    _tool_detail = {"tool": str(tool_name)[:80]}
+    _started = _lc.emit("tool", "tool.started", detail=_tool_detail)
+    _t0 = _time.monotonic()
+    try:
+        callbacks = _get_middleware_callbacks(TOOL_EXECUTION_MIDDLEWARE)
+        if not callbacks:
+            result = next_call(args)
+        else:
+            result = _run_execution_chain(
+                TOOL_EXECUTION_MIDDLEWARE,
+                callbacks,
+                next_call,
+                tool_name=tool_name,
+                args=args,
+                original_args=context.pop("original_args", args),
+                **context,
+            )
+    except BaseException:
+        _lc.emit(
+            "tool", "tool.failed", trace_id=_started["traceId"],
+            causation_id=_started["recordId"], outcome="failure",
+            duration_ms=(_time.monotonic() - _t0) * 1000.0, detail=_tool_detail,
+        )
+        raise
+    _lc.emit(
+        "tool", "tool.completed", trace_id=_started["traceId"],
+        causation_id=_started["recordId"], outcome="success",
+        duration_ms=(_time.monotonic() - _t0) * 1000.0, detail=_tool_detail,
     )
+    return result
 
 
 def run_api_execution_middleware(
