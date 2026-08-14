@@ -310,6 +310,13 @@ def _run_agent_tool_execution_middleware(
 
     from hermes_cli.middleware import run_tool_execution_middleware
 
+    # Tool-plane lifecycle records are emitted INSIDE
+    # run_tool_execution_middleware (hermes-gitops #476): the live proof
+    # showed this helper is NOT the single funnel - invoke_tool
+    # (agent_runtime_helpers.py) calls the middleware module directly on
+    # the concurrent path, so instrumenting here missed every concurrent
+    # tool call. The middleware function itself is the one seam both
+    # paths share.
     result = run_tool_execution_middleware(
         function_name,
         function_args,

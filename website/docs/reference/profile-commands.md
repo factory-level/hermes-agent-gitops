@@ -314,15 +314,16 @@ git so someone else can install it.
 ### `hermes profile install`
 
 ```bash
-hermes profile install <source> [--name <name>] [--alias] [--force] [--yes]
+hermes profile install <source> [--name <name>] [--subdir <path>] [--alias] [--force] [--yes]
 ```
 
 Installs a profile distribution from a git URL or a local directory.
 
 | Option | Description |
 |--------|-------------|
-| `<source>` | Git URL (`github.com/user/repo`, `https://...`, `git@...`, `ssh://`, `git://`) or a local directory containing `distribution.yaml` at its root. |
+| `<source>` | Git URL (`github.com/user/repo`, `https://...`, `git@...`, `ssh://`, `git://`) or a local directory containing `distribution.yaml` at its root. A git source may append a fragment: `#<ref>` (tag/branch/SHA) and/or `#subdirectory=<path>` — `#<ref>&subdirectory=<path>` for both — when the distribution lives in a subdirectory of the repo. |
 | `--name NAME` | Override the profile name from the manifest. |
+| `--subdir PATH` | Subdirectory of `<source>` containing `distribution.yaml` (equivalent to a `#subdirectory=PATH` fragment). |
 | `--alias` | Also create a shell wrapper (e.g. `telemetry` → `hermes -p telemetry`). |
 | `--force` | Overwrite an existing profile of the same name. User data is still preserved. |
 | `-y`, `--yes` | Skip the manifest-preview confirmation prompt. |
@@ -400,7 +401,13 @@ normally use `git clone` against the same repo first, then install.
 
 ### Distribution manifest (`distribution.yaml`)
 
-Every distribution has a `distribution.yaml` at the root of its repository:
+Every distribution has a `distribution.yaml` at the root of its
+repository — or at the root of the subdirectory selected with `--subdir`
+/ `#subdirectory=` at install time (monorepos can ship several
+distributions side by side, e.g.
+`hermes profile install github.com/org/monorepo#v1.2.0&subdirectory=agents/telemetry`;
+`hermes profile update` follows the recorded subdirectory
+automatically):
 
 ```yaml
 name: telemetry

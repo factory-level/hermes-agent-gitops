@@ -11912,6 +11912,7 @@ def cmd_profile(args):
                     args.source,
                     Path(tmp),
                     override_name=getattr(args, "install_name", None),
+                    subdir=getattr(args, "install_subdir", None) or "",
                 )
                 _render_distribution_plan(plan)
 
@@ -11929,6 +11930,7 @@ def cmd_profile(args):
                 name=getattr(args, "install_name", None),
                 force=getattr(args, "force", False),
                 create_alias=getattr(args, "alias", False),
+                subdir=getattr(args, "install_subdir", None) or "",
             )
             print(f"\n✓ Installed '{plan.manifest.name}' v{plan.manifest.version}")
             print(f"  Profile path: {plan.target_dir}")
@@ -12048,6 +12050,8 @@ def _render_distribution_plan(plan) -> None:
     if mf.hermes_requires:
         print(f"  Requires: Hermes {mf.hermes_requires}")
     print(f"  Source:   {plan.provenance}")
+    if getattr(plan, "subdir", ""):
+        print(f"  Subdir:   {plan.subdir}")
     print(f"  Target:   {plan.target_dir}")
     if plan.existing:
         # Distinguish "updating an existing distribution" (well-understood

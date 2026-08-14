@@ -238,7 +238,7 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run, claim_dispatch, heartbeat_run_claim
+from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run, claim_dispatch, heartbeat_run_claim, expire_temporary_enablements
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -3575,6 +3575,25 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
     Returns True if the job was processed (even if the job itself failed —
     failure is recorded via ``mark_job_run``), False only if processing raised.
     """
+    # Lifecycle records (#476): one trace per firing, causation-chained
+    # triggered -> started -> completed/failed, with the delivery leg as
+    # its own sub-chain. Free when HERMES_OBSERVER_URL is unset; a dead
+    # observer never touches the run (hermes_lifecycle's contract).
+    import hermes_lifecycle as _lc
+    from cron.jobs import lifecycle_job_label
+    _job_detail = {"job": lifecycle_job_label(job)}
+    _profile = str(job.get("profile") or "") or None
+    _test_run = str(job.get("test_run") or "") or None
+    _trig = _lc.emit(
+        "cron", "cron.triggered", profile=_profile, test_run=_test_run, detail=_job_detail
+    )
+    _run_started_at = time.monotonic()
+    # BaseException-safe: the ambient trace token must reset even on
+    # KeyboardInterrupt/SystemExit, because pool worker threads are
+    # REUSED and a leaked token bleeds this firing's trace into the next
+    # job's records (Codex catch). reset_current_trace is idempotent, so
+    # the success path's early reset plus this finally is safe.
+    _trace_token = None
     try:
         # Pre-run dispatch claim (issue #38758): atomically commit a finite
         # one-shot's dispatch BEFORE its side effect runs, so a tick that dies
@@ -3606,6 +3625,19 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         _scope_token = set_secret_scope(
             build_profile_secret_scope(_get_hermes_home())
         )
+        _start = _lc.emit(
+            "cron", "cron.started", trace_id=_trig["traceId"],
+            causation_id=_trig["recordId"], profile=_profile,
+            test_run=_test_run, detail=_job_detail,
+        )
+        # Ambient trace: everything inside this run - the agent plane
+        # below, every tool.* record the executor emits - joins this
+        # firing's trace instead of scattering one-record traces.
+        _trace_token = _lc.set_current_trace(_trig["traceId"], _start["recordId"])
+        _agent_started = _lc.emit(
+            "agent", "agent.started", profile=_profile,
+            test_run=_test_run, detail=_job_detail,
+        )
         # Defer the cron agent's async-resource teardown until AFTER delivery.
         # run_job normally closes the agent (and reaps stale async clients) in
         # its finally block; doing that before _deliver_result runs means the
@@ -3624,6 +3656,11 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             # (#10200), then re-raise into the outer handler. BaseException
             # (not just Exception) so a KeyboardInterrupt/SystemExit mid-run
             # still triggers teardown before propagating.
+            _lc.emit(
+                "agent", "agent.completed", causation_id=_agent_started["recordId"],
+                outcome="failure", profile=_profile, test_run=_test_run,
+                detail=_job_detail,
+            )
             for _deferred_agent in _deferred_agents:
                 _teardown_cron_agent(_deferred_agent, job["id"])
             raise
@@ -3636,6 +3673,12 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         # / empty-response computation, or _deliver_result itself — raises, the
         # deferred agent is still torn down. Otherwise the outer `except` would
         # swallow the error and leak the agent's subprocesses/clients (#10200).
+        _lc.emit(
+            "agent", "agent.completed", causation_id=_agent_started["recordId"],
+            outcome="success" if success else "failure",
+            profile=_profile, test_run=_test_run, detail=_job_detail,
+        )
+        _lc.reset_current_trace(_trace_token)
         delivery_error = None
         try:
             output_file = save_job_output(job["id"], output)
@@ -3675,11 +3718,26 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
                 should_deliver = False
 
             if should_deliver:
+                _dstart = _lc.emit(
+                    "cron", "cron.delivery.started", trace_id=_trig["traceId"],
+                    causation_id=_start["recordId"], profile=_profile,
+                    test_run=_test_run, detail=_job_detail,
+                )
                 try:
                     delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
                 except Exception as de:
                     delivery_error = str(de)
                     logger.error("Delivery failed for job %s: %s", job["id"], de)
+                # Delivery failure records SEPARATELY from job completion:
+                # a delivered-nothing run that reports success is the
+                # failure mode #349 exists to close.
+                _lc.emit(
+                    "cron",
+                    "cron.delivery.failed" if delivery_error else "cron.delivery.completed",
+                    trace_id=_trig["traceId"], causation_id=_dstart["recordId"],
+                    outcome="failure" if delivery_error else "success",
+                    profile=_profile, test_run=_test_run, detail=_job_detail,
+                )
         finally:
             # Tear down the deferred agent(s) now that save + delivery have run
             # (or raised). Must happen on every path so cron agents never leak
@@ -3694,15 +3752,37 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             success = False
             error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
+        # The TERMINAL cron record, emitted beside mark_job_run and after
+        # every fact that can flip the verdict (empty-response guard,
+        # interruption, delivery) - a cron.completed followed by a
+        # contradictory cron.failed is worse than a late record (Codex
+        # catch). Delivery has its own sub-chain above; this is the run's
+        # verdict.
+        _lc.emit(
+            "cron", "cron.completed" if success else "cron.failed",
+            trace_id=_trig["traceId"], causation_id=_start["recordId"],
+            outcome="success" if success else "failure",
+            duration_ms=(time.monotonic() - _run_started_at) * 1000.0,
+            profile=_profile, test_run=_test_run, detail=_job_detail,
+        )
         if not _consume_interrupted_flag(job["id"]):
             mark_job_run(job["id"], success, error, delivery_error=delivery_error)
         return True
 
     except Exception as e:
         logger.error("Error processing job %s: %s", job['id'], e)
+        _lc.emit(
+            "cron", "cron.failed", trace_id=_trig["traceId"],
+            causation_id=_trig["recordId"], outcome="failure",
+            duration_ms=(time.monotonic() - _run_started_at) * 1000.0,
+            profile=_profile, test_run=_test_run, detail=_job_detail,
+        )
         if not _consume_interrupted_flag(job["id"]):
             mark_job_run(job["id"], False, str(e))
         return False
+    finally:
+        if _trace_token is not None:
+            _lc.reset_current_trace(_trace_token)
 
 
 def _notify_provider_jobs_changed() -> None:
@@ -3768,6 +3848,14 @@ def tick(
         if can_dispatch is not None and not can_dispatch():
             logger.debug("Cron dispatch paused while gateway drains existing work")
             return 0
+
+        # Temporary enablements expire HERE, under the tick lock, before
+        # dueness is computed - so a job resumed "for 30 minutes" can
+        # never fire past its deadline (#476). The pause carries a
+        # self-explaining reason and emits cron.disabled.
+        expired = expire_temporary_enablements()
+        if expired and verbose:
+            logger.info("%d temporary enablement(s) expired and re-paused", expired)
 
         due_jobs = get_due_jobs()
 

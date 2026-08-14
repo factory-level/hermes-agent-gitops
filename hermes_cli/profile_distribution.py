@@ -22,9 +22,14 @@ Subcommands (all live under ``hermes profile``, not a parallel tree):
 
 * A git URL (``github.com/user/repo``, ``https://github.com/...``, ``git@...``,
   ``ssh://``, ``git://``), optionally with ``#<ref>`` to pin a tag / branch /
-  commit SHA.
+  commit SHA. The resolved ref and commit SHA are recorded in the installed
+  manifest as ``installed_ref`` / ``installed_sha`` (see below); ``hermes
+  profile update`` re-pulls that same ``#<ref>`` — a branch pin re-resolves
+  to the branch's current tip, while a tag or commit-SHA pin stays fixed.
 * A local directory that already contains ``distribution.yaml`` — used
-  during profile development before the first push.
+  during profile development before the first push. Local-dir installs
+  have no ref/sha to record; ``installed_ref`` / ``installed_sha`` are
+  left empty (and omitted from the written manifest entirely).
 
 Manifest format (``distribution.yaml`` at the profile root)::
 
@@ -48,6 +53,15 @@ Manifest format (``distribution.yaml`` at the profile root)::
       - cron/
       - mcp.json
 
+Any other top-level key is a vendor extension block (e.g. a downstream
+tool's ``deployment:`` / ``reach:`` config) — unrecognized by this
+dataclass, but preserved verbatim through install / update rather than
+being dropped. See ``DistributionManifest.extras``.
+
+**Reserved names**: The top-level key ``extras`` is reserved for internal
+use and may not appear literally in a source distribution.yaml; attempting
+to use it will raise a ``DistributionError``.
+
 Update semantics:
 
 * Distribution-owned paths (SOUL.md, mcp.json, skills/, cron/,
@@ -61,6 +75,7 @@ Update semantics:
 
 from __future__ import annotations
 
+import logging
 import re
 import shutil
 import subprocess
@@ -68,9 +83,12 @@ import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, ClassVar, Dict, FrozenSet, List, Optional, Tuple
 
 from agent.skill_utils import is_excluded_skill_path
+from utils import env_var_enabled
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -128,6 +146,20 @@ class DistributionError(Exception):
     """Raised for distribution install/update failures."""
 
 
+class ProfileHookError(DistributionError):
+    """Raised when a strict profile lifecycle hook demands fail-loud exit.
+
+    Fired either by a callback returning ``{"error": ..., "fatal": True}``
+    (a subscriber, e.g. the gitops-emitter plugin, hit an unrecoverable
+    error pushing the install record) or by the ``HERMESVISOR_REQUIRE_EMITTER``
+    guard finding no subscriber at all. In both cases the profile itself is
+    already durably installed on disk — only the CLI's exit code reflects
+    the hook failure (see ``cmd_profile``'s existing
+    ``except (DistributionError, ValueError)`` handler, which this subclass
+    routes through unchanged).
+    """
+
+
 # ---------------------------------------------------------------------------
 # Manifest
 # ---------------------------------------------------------------------------
@@ -181,12 +213,41 @@ class DistributionManifest:
     # ``list`` can show when a distribution landed on disk.  Empty for
     # manifests that ship in a repo (authors don't populate this).
     installed_at: str = ""
+    # The ``#<ref>`` pin (tag / branch / commit SHA) and the exact commit
+    # SHA it resolved to, both captured at install/update time.  Empty for
+    # a git source with no ``#<ref>`` (installed_sha is still populated —
+    # it's HEAD's sha) and for local-directory sources (both empty).
+    installed_ref: str = ""
+    installed_sha: str = ""
+    # Unknown top-level keys from the source distribution.yaml — vendor
+    # extension blocks (e.g. HermesVisor's ``deployment:`` / ``reach:`` /
+    # ``workloads:`` / ``expose:``, but generically ANY key an author adds
+    # that this dataclass doesn't know about). Captured verbatim in
+    # from_dict() and re-emitted as-is in to_dict() so install/update never
+    # silently drops them. Never populated by hand — always derived from
+    # the parsed manifest.
+    extras: Dict[str, Any] = field(default_factory=dict)
+
+    # Every field name this dataclass understands — anything else in a
+    # parsed manifest's top-level mapping falls through to ``extras``.
+    # ClassVar so dataclass doesn't treat this as an instance field.
+    _KNOWN_KEYS: ClassVar[FrozenSet[str]] = frozenset({
+        "name", "version", "description", "hermes_requires", "author",
+        "license", "env_requires", "distribution_owned", "source",
+        "installed_at", "installed_ref", "installed_sha", "extras",
+    })
 
     @classmethod
     def from_dict(cls, data: Any) -> "DistributionManifest":
         if not isinstance(data, dict):
             raise DistributionError(
                 f"{MANIFEST_FILENAME} must be a mapping, got {type(data).__name__}"
+            )
+        # Check for reserved top-level key that would silently drop data
+        if "extras" in data:
+            raise DistributionError(
+                "distribution.yaml may not use the reserved top-level key 'extras'; "
+                "rename it to avoid data loss"
             )
         name = str(data.get("name") or "").strip()
         if not name:
@@ -199,6 +260,7 @@ class DistributionManifest:
         if dist_owned_raw and not isinstance(dist_owned_raw, list):
             raise DistributionError("distribution_owned must be a list")
         distribution_owned = [str(p).strip().strip("/") for p in dist_owned_raw if str(p).strip()]
+        extras = {k: v for k, v in data.items() if k not in cls._KNOWN_KEYS}
         return cls(
             name=name,
             version=str(data.get("version") or "0.1.0"),
@@ -210,6 +272,9 @@ class DistributionManifest:
             distribution_owned=distribution_owned,
             source=str(data.get("source") or ""),
             installed_at=str(data.get("installed_at") or ""),
+            installed_ref=str(data.get("installed_ref") or ""),
+            installed_sha=str(data.get("installed_sha") or ""),
+            extras=extras,
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -233,6 +298,12 @@ class DistributionManifest:
             out["source"] = self.source
         if self.installed_at:
             out["installed_at"] = self.installed_at
+        if self.installed_ref:
+            out["installed_ref"] = self.installed_ref
+        if self.installed_sha:
+            out["installed_sha"] = self.installed_sha
+        for key, value in self.extras.items():
+            out[key] = value
         return out
 
     def owned_paths(self) -> List[str]:
@@ -372,16 +443,196 @@ def _looks_like_git_url(s: str) -> bool:
     return False
 
 
-def _git_clone(url: str, dest: Path) -> None:
+def _split_source_ref(source: str) -> Tuple[str, str]:
+    """Split a trailing ``#<ref>`` off *source*.
+
+    Returns ``(url, ref)`` — ``ref`` is ``""`` when *source* has no
+    fragment.  Uses ``rsplit`` with ``maxsplit=1`` so only the final ``#``
+    is treated as the ref separator; an earlier literal ``#`` in the URL
+    itself is left alone.
+
+    Must run BEFORE ``_looks_like_git_url`` — that check knows nothing
+    about fragments (``github.com/u/r#v1`` fails its shorthand regex,
+    ``path.git#ref`` fails the ``.git``-suffix check) and is meant to stay
+    that way; ref-splitting happens one layer up, in ``_stage_source``.
+    """
+    if "#" not in source:
+        return source, ""
+    url, ref = source.rsplit("#", 1)
+    return url, ref
+
+
+_SUBDIR_PARAM = "subdirectory="
+
+
+def _parse_fragment(fragment: str) -> Tuple[str, str]:
+    """Parse a source fragment into ``(ref, subdir)``.
+
+    Pip-style grammar: ``<ref>``, ``subdirectory=<path>``, or
+    ``<ref>&subdirectory=<path>``. Splitting uses ``rpartition("&")`` and
+    only treats the tail as a subdirectory parameter when it starts with
+    ``subdirectory=`` — so a ref whose name contains a literal ``&``
+    still round-trips (``a&b`` -> ref ``a&b``). Two shapes are
+    deliberately inexpressible and pathological enough not to matter: a
+    ref literally named ``subdirectory=...`` and a ref ending in
+    ``&subdirectory=...``.
+    """
+    if not fragment:
+        return "", ""
+    if fragment.startswith(_SUBDIR_PARAM):
+        ref, subdir = "", fragment[len(_SUBDIR_PARAM):]
+    else:
+        head, sep, tail = fragment.rpartition("&")
+        if sep and tail.startswith(_SUBDIR_PARAM):
+            ref, subdir = head, tail[len(_SUBDIR_PARAM):]
+        else:
+            return fragment, ""
+    if not subdir:
+        raise DistributionError(
+            f"Empty {_SUBDIR_PARAM} value in source fragment {fragment!r}."
+        )
+    if _SUBDIR_PARAM in ref or ref.startswith(_SUBDIR_PARAM):
+        raise DistributionError(
+            f"Multiple {_SUBDIR_PARAM} parameters in source fragment "
+            f"{fragment!r} — pass exactly one."
+        )
+    return ref, subdir
+
+
+def _normalize_subdir(subdir: str) -> str:
+    """Validate and normalize a distribution subdirectory path.
+
+    Accepts only a relative path inside the source tree; returns the
+    cleaned ``/``-joined form (``./x/`` -> ``x``).
+    """
+    def _bad() -> "DistributionError":
+        return DistributionError(
+            f"Invalid distribution subdirectory {subdir!r}: must be a "
+            "relative path inside the repository (no leading '/', no "
+            "'..', no backslashes)."
+        )
+
+    if "\\" in subdir or subdir.startswith("/"):
+        raise _bad()
+    parts = [p for p in subdir.split("/") if p not in ("", ".")]
+    if not parts or any(p == ".." for p in parts):
+        raise _bad()
+    return "/".join(parts)
+
+
+def _merge_subdir(frag_subdir: str, flag_subdir: str) -> str:
+    """Combine fragment- and flag-supplied subdirs (both optional).
+
+    Both are normalized; giving both is allowed only when they agree.
+    """
+    frag = _normalize_subdir(frag_subdir) if frag_subdir else ""
+    flag = _normalize_subdir(flag_subdir) if flag_subdir else ""
+    if frag and flag and frag != flag:
+        raise DistributionError(
+            f"Conflicting subdirectories: --subdir {flag!r} vs source "
+            f"fragment 'subdirectory={frag}'. Pass just one (they must "
+            "match if both are given)."
+        )
+    return frag or flag
+
+
+def _descend_subdir(root: Path, subdir: str, source_label: str) -> Path:
+    """Return ``root/subdir`` after safety checks.
+
+    Rejects symlinked path components (they would smuggle content past
+    the per-tree symlink scan, which only covers the final subtree),
+    escapes outside *root*, and missing directories — each with a
+    message naming the exact path.
+    """
+    walk = root
+    for part in subdir.split("/"):
+        walk = walk / part
+        if walk.is_symlink():
+            raise DistributionError(
+                f"Distribution subdirectory path contains a symlink: {subdir!r}"
+            )
+    resolved = walk.resolve()
+    root_resolved = root.resolve()
+    if not (resolved == root_resolved or root_resolved in resolved.parents):
+        raise DistributionError(
+            f"Invalid distribution subdirectory {subdir!r}: must be a "
+            "relative path inside the repository (no leading '/', no "
+            "'..', no backslashes)."
+        )
+    if not walk.is_dir():
+        raise DistributionError(
+            f"Subdirectory {subdir!r} does not exist in {source_label!r}."
+        )
+    return walk
+
+
+def _canonical_provenance(url: str, ref: str, subdir: str) -> str:
+    """Rebuild the recorded ``source:`` string from its parts.
+
+    Byte-identical to the historical verbatim behavior for ref-only
+    sources; a subdir (whether it arrived via the fragment or the
+    ``--subdir`` flag) is baked in as ``subdirectory=`` so
+    ``hermes profile update`` re-resolves it with no extra manifest
+    fields.
+    """
+    if ref and subdir:
+        return f"{url}#{ref}&{_SUBDIR_PARAM}{subdir}"
+    if subdir:
+        return f"{url}#{_SUBDIR_PARAM}{subdir}"
+    if ref:
+        return f"{url}#{ref}"
+    return url
+
+
+def _git_clone(url: str, dest: Path, ref: str = "") -> str:
+    """Clone *url* into *dest*, optionally pinned to *ref*.
+
+    Returns the resolved commit SHA (captured before the caller strips
+    ``.git``).
+
+    * No ``ref`` — plain shallow clone of the default branch.
+    * ``ref`` given — try a shallow clone of that ref first (works for
+      both branches and tags). If that fails (``ref`` is a commit SHA,
+      which shallow clone can't target directly over most transports),
+      fall back to a full clone followed by a detached checkout of
+      ``ref`` — this covers arbitrary commit SHAs portably.
+    """
     # Normalize github.com/user/repo shorthand
     if re.match(r"^github\.com/[\w.-]+/[\w.-]+/?$", url):
         url = f"https://{url.rstrip('/')}"
     try:
-        subprocess.run(
-            ["git", "clone", "--depth", "1", url, str(dest)],
+        if not ref:
+            subprocess.run(
+                ["git", "clone", "--depth", "1", url, str(dest)],
+                check=True,
+                capture_output=True,
+            )
+        else:
+            try:
+                subprocess.run(
+                    ["git", "clone", "--depth", "1", "--branch", ref, url, str(dest)],
+                    check=True,
+                    capture_output=True,
+                )
+            except subprocess.CalledProcessError:
+                shutil.rmtree(dest, ignore_errors=True)
+                subprocess.run(
+                    ["git", "clone", url, str(dest)],
+                    check=True,
+                    capture_output=True,
+                )
+                subprocess.run(
+                    ["git", "-C", str(dest), "checkout", "--detach", ref],
+                    check=True,
+                    capture_output=True,
+                )
+        rev = subprocess.run(
+            ["git", "-C", str(dest), "rev-parse", "HEAD"],
             check=True,
             capture_output=True,
+            text=True,
         )
+        return rev.stdout.strip()
     except FileNotFoundError as exc:
         raise DistributionError("git is required for git-URL installs") from exc
     except subprocess.CalledProcessError as exc:
@@ -389,42 +640,105 @@ def _git_clone(url: str, dest: Path) -> None:
         raise DistributionError(f"git clone failed: {stderr.strip()}") from exc
 
 
-def _stage_source(source: str, workdir: Path) -> Tuple[Path, str]:
+def _stage_source(
+    source: str, workdir: Path, subdir: str = ""
+) -> Tuple[Path, str, str, str, str]:
     """Resolve *source* to a local directory containing distribution.yaml.
 
-    Returns ``(staged_dir, provenance)`` where ``provenance`` is stored in the
-    installed manifest's ``source:`` field so ``hermes profile update`` can
-    re-pull from the same place.
+    Returns ``(staged_dir, provenance, ref, sha, subdir)``:
+
+    * ``provenance`` is the canonical source string (url + ``#<ref>`` /
+      ``subdirectory=<path>`` fragment, rebuilt via
+      ``_canonical_provenance``) stored in the installed manifest's
+      ``source:`` field so ``hermes profile update`` re-pulls from the
+      same place — and re-resolves the same pin (a branch pin follows
+      the branch; a tag / commit-SHA pin stays fixed; a subdir is baked
+      into the fragment so it round-trips with no extra manifest
+      fields). Byte-identical to the pre-subdir verbatim behavior for
+      every previously-valid source.
+    * ``ref`` / ``sha`` are the resolved git ref and commit SHA. Both are
+      ``""`` for local-directory sources, which have no ref pin at all.
+    * ``subdir`` is the normalized effective subdirectory (``""`` when
+      the distribution is at the source root — including local installs,
+      whose provenance points directly at the resolved subtree, see
+      below).
 
     Accepts:
-      * A git URL (https / ssh / git@ / bare github.com shorthand) — cloned
-        into a temp directory; ``.git`` removed after clone.
-      * A local directory already containing ``distribution.yaml``.
+      * A git URL (https / ssh / git@ / bare github.com shorthand),
+        optionally suffixed with a fragment: ``#<ref>``,
+        ``#subdirectory=<path>``, or ``#<ref>&subdirectory=<path>`` —
+        cloned into a temp directory; ``.git`` removed after clone; the
+        distribution root is the named subdirectory when one is given.
+      * A local directory containing ``distribution.yaml`` at its root
+        (or under *subdir* when given). A literal ``#`` in an EXISTING
+        local path is still part of the path, never a fragment; the
+        fragment form is honored for local dirs only when the literal
+        path does not exist. Local provenance records the resolved
+        SUBTREE path (no fragment) — updating re-stages that directory
+        as its own root, which is equivalent.
     """
     src_str = source.strip()
+    url_part, fragment = _split_source_ref(src_str)
 
-    # Git URL
-    if _looks_like_git_url(src_str):
+    # Git URL — ref-split url_part is what _looks_like_git_url evaluates,
+    # per the fragment-free contract documented on _split_source_ref.
+    if _looks_like_git_url(url_part):
+        ref, frag_subdir = _parse_fragment(fragment)
+        eff_subdir = _merge_subdir(frag_subdir, subdir)
         cloned = workdir / "clone"
-        _git_clone(src_str, cloned)
+        sha = _git_clone(url_part, cloned, ref=ref)
         # Remove .git to keep the staged tree clean
         shutil.rmtree(cloned / ".git", ignore_errors=True)
-        if not (cloned / MANIFEST_FILENAME).is_file():
+        staged = (
+            _descend_subdir(cloned, eff_subdir, url_part) if eff_subdir else cloned
+        )
+        if not (staged / MANIFEST_FILENAME).is_file():
+            if eff_subdir:
+                raise DistributionError(
+                    f"No {MANIFEST_FILENAME} at {eff_subdir}/{MANIFEST_FILENAME} "
+                    f"in {url_part!r}. This subdirectory is not a Hermes "
+                    "profile distribution."
+                )
             raise DistributionError(
                 f"No {MANIFEST_FILENAME} at the root of {src_str!r}. "
                 "This repository is not a Hermes profile distribution."
             )
-        return cloned, src_str
+        provenance = _canonical_provenance(url_part, ref, eff_subdir)
+        return staged, provenance, ref, sha, eff_subdir
 
-    # Local directory
+    # Local directory — the ORIGINAL (unsplit) string wins when it names
+    # an existing directory: a literal '#' in a local path is part of the
+    # path, not a fragment (long-standing behavior). Only when the literal
+    # path does NOT exist do we consider a fragment-bearing local source.
     path_guess = Path(src_str).expanduser()
+    frag_subdir = ""
+    if not path_guess.is_dir() and fragment:
+        ref_candidate, frag_subdir = _parse_fragment(fragment)
+        if frag_subdir and not ref_candidate and Path(url_part).expanduser().is_dir():
+            # Local dirs have no ref pins; only a pure-subdir fragment is
+            # meaningful here.
+            path_guess = Path(url_part).expanduser()
+        else:
+            frag_subdir = ""
     if path_guess.is_dir():
-        if not (path_guess / MANIFEST_FILENAME).is_file():
+        eff_subdir = _merge_subdir(frag_subdir, subdir)
+        root = path_guess.resolve()
+        staged = (
+            _descend_subdir(root, eff_subdir, str(root)) if eff_subdir else root
+        )
+        if not (staged / MANIFEST_FILENAME).is_file():
             raise DistributionError(
-                f"No {MANIFEST_FILENAME} in {path_guess}. "
-                "A local-directory source must contain a distribution.yaml at its root."
+                f"No {MANIFEST_FILENAME} in {staged}. "
+                "A local-directory source must contain a distribution.yaml "
+                "at its root (or under the given --subdir)."
             )
-        return path_guess.resolve(), str(path_guess.resolve())
+        # Provenance = the resolved subtree itself, and the reported
+        # subdir is "" to match: the (source, subdir) pair must always
+        # compose to the dist root, and here the recorded source ALREADY
+        # points at the subtree — hook consumers (e.g. the gitops-emitter)
+        # resolve <source>/<subdir> and must not descend twice. Future
+        # updates re-stage the subtree directly as their own root.
+        return staged.resolve(), str(staged.resolve()), "", "", ""
 
     raise DistributionError(
         f"Cannot resolve distribution source: {source!r}. "
@@ -462,6 +776,9 @@ class InstallPlan:
     preserves_config: bool = True
     has_cron: bool = False
     has_skills: bool = False
+    ref: str = ""
+    sha: str = ""
+    subdir: str = ""
 
 
 def _has_cron_jobs(staged: Path) -> bool:
@@ -488,8 +805,14 @@ def plan_install(
     source: str,
     workdir: Path,
     override_name: Optional[str] = None,
+    subdir: str = "",
 ) -> InstallPlan:
-    """Stage *source* and produce a plan describing what install would do."""
+    """Stage *source* and produce a plan describing what install would do.
+
+    *subdir* is the ``--subdir`` flag value; a subdirectory may equally
+    arrive via the source fragment (``#subdirectory=<path>``) — see
+    ``_stage_source``.
+    """
     from hermes_cli.profiles import (
         get_profile_dir,
         normalize_profile_name,
@@ -497,7 +820,9 @@ def plan_install(
     )
     from hermes_cli import __version__ as hermes_version
 
-    staged, provenance = _stage_source(source, workdir)
+    staged, provenance, ref, sha, subdir_resolved = _stage_source(
+        source, workdir, subdir=subdir
+    )
     _reject_distribution_symlinks(staged)
     manifest = read_manifest(staged)
     if manifest is None:
@@ -521,6 +846,8 @@ def plan_install(
         )
     manifest.name = canon
     manifest.source = provenance
+    manifest.installed_ref = ref
+    manifest.installed_sha = sha
     # Stamped once here so plan_install() callers (both fresh install and
     # update) propagate a freshly-minted timestamp through _copy_dist_payload.
     manifest.installed_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -539,6 +866,9 @@ def plan_install(
         preserves_config=existing,
         has_cron=has_cron,
         has_skills=skill_count > 0,
+        ref=ref,
+        sha=sha,
+        subdir=subdir_resolved,
     )
 
 
@@ -603,47 +933,191 @@ def _bootstrap_user_dirs(target: Path) -> None:
         (target / d).mkdir(parents=True, exist_ok=True)
 
 
+def _fragment_free_source_url(provenance: str, ref: str, subdir: str = "") -> str:
+    """Strip the canonical fragment from *provenance* for hook payloads.
+
+    ``provenance`` (``InstallPlan.provenance`` / the manifest's ``source:``
+    field) carries the canonical fragment (``#<ref>``,
+    ``#subdirectory=<path>``, or ``#<ref>&subdirectory=<path>``) so
+    ``update`` re-resolves the same pin. Hook payloads want the parts
+    separated (``source_url`` + ``ref`` + ``subdir``). Only strips when a
+    matching canonical fragment is present — local-directory sources have
+    empty ref AND subdir-free provenance (it points at the subtree), so a
+    literal ``#`` in a local path is never touched.
+    """
+    candidates = []
+    if ref and subdir:
+        candidates.append(f"{ref}&{_SUBDIR_PARAM}{subdir}")
+    if subdir:
+        candidates.append(f"{_SUBDIR_PARAM}{subdir}")
+    if ref:
+        candidates.append(ref)
+    for frag in candidates:
+        if provenance.endswith(f"#{frag}"):
+            return provenance[: -(len(frag) + 1)]
+    return provenance
+
+
+def _split_source_for_hooks(source: str) -> Tuple[str, str, str]:
+    """Best-effort ``(source_url, ref, subdir)`` split for FAILURE hooks.
+
+    Used when staging died before ``plan_install`` returned — mirrors the
+    success-path payload contract without ever raising (an unparseable
+    fragment degrades to the old two-way split).
+    """
+    url, fragment = _split_source_ref(source)
+    try:
+        ref, subdir = _parse_fragment(fragment)
+    except DistributionError:
+        return url, fragment, ""
+    if subdir:
+        try:
+            subdir = _normalize_subdir(subdir)
+        except DistributionError:
+            return url, fragment, ""
+    return url, ref, subdir
+
+
+def _fire_profile_lifecycle_hook(hook_name: str, *, strict: bool, **fields: Any) -> None:
+    """Fire a profile lifecycle plugin hook, best-effort at the infra layer.
+
+    Called by install/update AFTER durable install state (manifest written,
+    payload copied to the target profile dir) so a plugin callback always
+    observes a profile that's already on disk. Plugin discovery does not
+    run on the profile install/update path otherwise, so this fires it
+    itself (idempotent — a no-op once already discovered).
+
+    Any infra failure (plugins unavailable, discovery error) is swallowed —
+    a misbehaving or absent plugin subsystem must never block an install.
+
+    When *strict* is True (``profile_install`` / ``profile_update``), a
+    callback may opt the CLI into fail-loud behavior by returning
+    ``{"error": str, "fatal": True, "plugin": str}`` — see the
+    ``profile_install`` entry in ``VALID_HOOKS`` for the full contract.
+    ``profile_install_failed`` is always fired with ``strict=False``: it's
+    observer-only, so a failing push there can't also fail the failure
+    report.
+    """
+    try:
+        from hermes_cli.plugins import discover_plugins, has_hook, invoke_hook
+
+        discover_plugins()
+        results = invoke_hook(hook_name, **fields)
+    except Exception as exc:  # infra failure = best-effort, never blocks the install
+        logger.debug("profile lifecycle hook %s failed: %s", hook_name, exc)
+        return
+
+    if not strict:
+        return
+
+    if env_var_enabled("HERMESVISOR_REQUIRE_EMITTER") and not has_hook(hook_name):
+        raise ProfileHookError(
+            f"Profile was installed, but HERMESVISOR_REQUIRE_EMITTER is set and "
+            f"no plugin is subscribed to {hook_name}."
+        )
+
+    fatal = [r for r in results if isinstance(r, dict) and r.get("fatal") and r.get("error")]
+    if fatal:
+        raise ProfileHookError(
+            "Profile was installed, but a post-install hook failed: "
+            + "; ".join(f"[{f.get('plugin', '?')}] {f['error']}" for f in fatal)
+        )
+
+
 def install_distribution(
     source: str,
     name: Optional[str] = None,
     force: bool = False,
     create_alias: bool = False,
+    subdir: str = "",
 ) -> InstallPlan:
     """Install a distribution from *source* into a new profile.
 
     Returns the resolved :class:`InstallPlan`.  Use :func:`plan_install`
     first if you want to preview + prompt the user before calling this.
+
+    Fires the ``profile_install`` lifecycle hook after the install is
+    durable on disk. A subscriber (e.g. HermesVisor's gitops-emitter
+    plugin) may return a fatal error dict to make this raise
+    :class:`ProfileHookError` — the profile stays installed either way.
+    On any other :class:`DistributionError` (install itself failed) — or a
+    bare :class:`ValueError` from ``plan_install``'s profile-name validation
+    (e.g. a reserved name) — fires ``profile_install_failed`` instead.
     """
     from hermes_cli.profiles import (
         check_alias_collision,
         create_wrapper_script,
     )
 
-    with tempfile.TemporaryDirectory(prefix="hermes_dist_install_") as tmp:
-        plan = plan_install(source, Path(tmp), override_name=name)
+    plan: Optional[InstallPlan] = None
+    try:
+        with tempfile.TemporaryDirectory(prefix="hermes_dist_install_") as tmp:
+            plan = plan_install(source, Path(tmp), override_name=name, subdir=subdir)
 
-        if plan.existing and not force:
-            raise DistributionError(
-                f"Profile '{plan.manifest.name}' already exists at {plan.target_dir}. "
-                "Use `hermes profile update` to upgrade in place, "
-                "or pass --force to overwrite."
+            if plan.existing and not force:
+                raise DistributionError(
+                    f"Profile '{plan.manifest.name}' already exists at {plan.target_dir}. "
+                    "Use `hermes profile update` to upgrade in place, "
+                    "or pass --force to overwrite."
+                )
+
+            # Fresh install: config.yaml comes from the distribution.
+            _bootstrap_user_dirs(plan.target_dir)
+            _copy_dist_payload(
+                plan.staged_dir,
+                plan.target_dir,
+                plan.manifest,
+                preserve_config=False,
             )
 
-        # Fresh install: config.yaml comes from the distribution.
-        _bootstrap_user_dirs(plan.target_dir)
-        _copy_dist_payload(
-            plan.staged_dir,
-            plan.target_dir,
-            plan.manifest,
-            preserve_config=False,
-        )
+            if create_alias:
+                collision = check_alias_collision(plan.manifest.name)
+                if collision is None:
+                    create_wrapper_script(plan.manifest.name)
 
-        if create_alias:
-            collision = check_alias_collision(plan.manifest.name)
-            if collision is None:
-                create_wrapper_script(plan.manifest.name)
-
-        return plan
+            _fire_profile_lifecycle_hook(
+                "profile_install",
+                strict=True,
+                name=plan.manifest.name,
+                source_url=_fragment_free_source_url(
+                    plan.provenance, plan.ref, plan.subdir
+                ),
+                ref=plan.ref,
+                sha=plan.sha,
+                subdir=plan.subdir,
+                distribution_version=plan.manifest.version,
+                target_dir=str(plan.target_dir),
+                event="install",
+            )
+            return plan
+    except (DistributionError, ValueError) as e:
+        if not isinstance(e, ProfileHookError):
+            if plan is not None:
+                fail_source_url = _fragment_free_source_url(
+                    plan.provenance, plan.ref, plan.subdir
+                )
+                fail_ref = plan.ref
+                fail_subdir = plan.subdir
+            else:
+                # Staging failed before plan_install() returned — split the
+                # raw source's fragment ourselves so the payload matches the
+                # success-path contract (fragment-free source_url, populated
+                # ref/subdir) instead of dumping the raw fragment-bearing
+                # string into source_url.
+                fail_source_url, fail_ref, fail_subdir = _split_source_for_hooks(
+                    source
+                )
+            _fire_profile_lifecycle_hook(
+                "profile_install_failed",
+                strict=False,
+                name=plan.manifest.name if plan is not None else "",
+                source_url=fail_source_url,
+                ref=fail_ref,
+                subdir=fail_subdir,
+                error=str(e),
+                event="install_failed",
+            )
+        raise
 
 
 def update_distribution(
@@ -656,6 +1130,12 @@ def update_distribution(
     ``source:`` field.  Distribution-owned files are overwritten; user-owned
     data (memories, sessions, auth) is never touched.  ``config.yaml`` is
     preserved unless ``force_config`` is True.
+
+    Fires the ``profile_update`` lifecycle hook after the update is durable
+    on disk (see :func:`install_distribution` for the fail-loud contract).
+    On any other :class:`DistributionError` — or a bare :class:`ValueError`
+    from ``plan_install``'s profile-name validation (e.g. a reserved name) —
+    fires ``profile_install_failed`` (event ``"update_failed"``) instead.
     """
     from hermes_cli.profiles import (
         get_profile_dir,
@@ -681,21 +1161,71 @@ def update_distribution(
             "`hermes profile install <source> --name {canon} --force`."
         )
 
-    with tempfile.TemporaryDirectory(prefix="hermes_dist_update_") as tmp:
-        plan = plan_install(
-            existing_manifest.source,
-            Path(tmp),
-            override_name=canon,
-        )
-        plan.preserves_config = not force_config
+    # Captured BEFORE re-staging — plan_install below overwrites plan.manifest
+    # with the newly-staged version's fields.
+    previous_version = existing_manifest.version
+    previous_sha = existing_manifest.installed_sha
 
-        _copy_dist_payload(
-            plan.staged_dir,
-            plan.target_dir,
-            plan.manifest,
-            preserve_config=plan.preserves_config,
-        )
-        return plan
+    plan: Optional[InstallPlan] = None
+    try:
+        with tempfile.TemporaryDirectory(prefix="hermes_dist_update_") as tmp:
+            plan = plan_install(
+                existing_manifest.source,
+                Path(tmp),
+                override_name=canon,
+            )
+            plan.preserves_config = not force_config
+
+            _copy_dist_payload(
+                plan.staged_dir,
+                plan.target_dir,
+                plan.manifest,
+                preserve_config=plan.preserves_config,
+            )
+
+            _fire_profile_lifecycle_hook(
+                "profile_update",
+                strict=True,
+                name=plan.manifest.name,
+                source_url=_fragment_free_source_url(
+                    plan.provenance, plan.ref, plan.subdir
+                ),
+                ref=plan.ref,
+                sha=plan.sha,
+                subdir=plan.subdir,
+                distribution_version=plan.manifest.version,
+                target_dir=str(plan.target_dir),
+                event="update",
+                previous_version=previous_version,
+                previous_sha=previous_sha,
+            )
+            return plan
+    except (DistributionError, ValueError) as e:
+        if not isinstance(e, ProfileHookError):
+            if plan is not None:
+                fail_source_url = _fragment_free_source_url(
+                    plan.provenance, plan.ref, plan.subdir
+                )
+                fail_ref = plan.ref
+                fail_subdir = plan.subdir
+            else:
+                # Re-staging failed before plan_install() returned — split
+                # the recorded source's fragment ourselves, same rationale
+                # as the install_distribution() failure path above.
+                fail_source_url, fail_ref, fail_subdir = _split_source_for_hooks(
+                    existing_manifest.source
+                )
+            _fire_profile_lifecycle_hook(
+                "profile_install_failed",
+                strict=False,
+                name=plan.manifest.name if plan is not None else canon,
+                source_url=fail_source_url,
+                ref=fail_ref,
+                subdir=fail_subdir,
+                error=str(e),
+                event="update_failed",
+            )
+        raise
 
 
 # ---------------------------------------------------------------------------

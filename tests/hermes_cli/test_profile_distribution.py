@@ -140,6 +140,16 @@ class TestManifestParsing:
     def test_read_manifest_returns_none_when_absent(self, tmp_path):
         assert read_manifest(tmp_path) is None
 
+    def test_reserved_extras_key_rejected(self, tmp_path):
+        """A manifest with a literal 'extras' key must raise DistributionError."""
+        (tmp_path / MANIFEST_FILENAME).write_text(
+            "name: bad\n"
+            "extras:\n"
+            "  deployment: {kind: worker}\n"
+        )
+        with pytest.raises(DistributionError, match="reserved top-level key 'extras'"):
+            read_manifest(tmp_path)
+
     def test_owned_paths_default(self):
         m = DistributionManifest(name="x")
         assert m.owned_paths() == list(DEFAULT_DIST_OWNED)
@@ -347,6 +357,19 @@ class TestInstall:
         staged = _make_staging_dir(profile_env, "future", manifest=mf)
         with pytest.raises(DistributionError, match="requires Hermes"):
             install_distribution(str(staged), name="future")
+
+    def test_install_rejects_literal_extras_key(self, profile_env, tmp_path):
+        """A staged manifest with a literal 'extras' key must fail with reserved-key message."""
+        staged = _make_staging_dir(profile_env, "src")
+        # Manually write distribution.yaml with a literal 'extras' key
+        (staged / MANIFEST_FILENAME).write_text(
+            "name: badextras\n"
+            "version: 0.1.0\n"
+            "extras:\n"
+            "  deployment: {kind: worker}\n"
+        )
+        with pytest.raises(DistributionError, match="reserved top-level key 'extras'"):
+            plan_install(str(staged), tmp_path / "work", override_name="badextras")
 
 
 # ===========================================================================
@@ -657,6 +680,119 @@ class TestProfileInfoDistribution:
 # ===========================================================================
 
 
+class TestExtrasPreservation:
+    """Unknown top-level keys in distribution.yaml (vendor extension blocks,
+    e.g. HermesVisor's `deployment:` / `reach:` / `workloads:` / `expose:`)
+    must round-trip through install/update instead of being silently
+    stripped by to_dict()'s known-fields-only serialization."""
+
+    def test_from_dict_captures_unknown_keys_as_extras(self):
+        m = DistributionManifest.from_dict({
+            "name": "x",
+            "deployment": {"kind": "worker", "replicas": 3},
+            "workloads": [{"name": "a"}, {"name": "b"}],
+        })
+        assert m.extras == {
+            "deployment": {"kind": "worker", "replicas": 3},
+            "workloads": [{"name": "a"}, {"name": "b"}],
+        }
+
+    def test_to_dict_reemits_extras_after_known_keys(self):
+        m = DistributionManifest.from_dict({
+            "name": "x",
+            "version": "1.0.0",
+            "deployment": {"kind": "worker"},
+        })
+        out = m.to_dict()
+        assert out["deployment"] == {"kind": "worker"}
+        keys = list(out.keys())
+        assert keys.index("deployment") > keys.index("version")
+
+    def test_vanilla_manifest_never_emits_literal_extras_key(self):
+        m = DistributionManifest(name="plain", version="1.0.0")
+        out = m.to_dict()
+        assert "extras" not in out
+        assert m.extras == {}
+
+    def test_known_runtime_fields_are_not_double_handled_as_extras(self):
+        m = DistributionManifest.from_dict({
+            "name": "x",
+            "source": "github.com/u/r",
+            "installed_at": "2024-01-01T00:00:00+00:00",
+            "installed_ref": "v1",
+            "installed_sha": "deadbeef",
+        })
+        assert m.extras == {}
+        assert m.source == "github.com/u/r"
+        assert m.installed_ref == "v1"
+        assert m.installed_sha == "deadbeef"
+
+    def test_from_dict_to_dict_roundtrip_with_extras(self, tmp_path):
+        raw = {
+            "name": "rt",
+            "version": "2.0.0",
+            "deployment": {"kind": "worker", "replicas": 3, "env": {"A": "1"}},
+            "workloads": [{"name": "a", "cpu": 1}, {"name": "b", "cpu": 2}],
+            "expose": ["8080/tcp"],
+        }
+        write_manifest(tmp_path, DistributionManifest.from_dict(raw))
+        reparsed = read_manifest(tmp_path)
+        assert reparsed.to_dict()["deployment"] == raw["deployment"]
+        assert reparsed.to_dict()["workloads"] == raw["workloads"]
+        assert reparsed.to_dict()["expose"] == raw["expose"]
+
+    def test_from_dict_to_dict_roundtrip_without_extras_unchanged(self):
+        raw = {"name": "plain", "version": "1.0.0", "description": "no extras here"}
+        m = DistributionManifest.from_dict(raw)
+        out = m.to_dict()
+        assert "extras" not in out
+        assert out == {"name": "plain", "version": "1.0.0", "description": "no extras here"}
+
+    def test_install_preserves_extension_blocks_on_disk(self, profile_env):
+        mf = DistributionManifest.from_dict({
+            "name": "vendorext",
+            "version": "0.1.0",
+            "deployment": {"kind": "worker", "replicas": 3},
+            "workloads": [{"name": "svc-a"}, {"name": "svc-b"}],
+        })
+        staged = _make_staging_dir(profile_env, "vendorext", manifest=mf)
+        plan = install_distribution(str(staged), name="vendorext")
+
+        import yaml
+        installed_raw = yaml.safe_load(
+            (plan.target_dir / MANIFEST_FILENAME).read_text()
+        )
+        assert installed_raw["deployment"] == {"kind": "worker", "replicas": 3}
+        assert installed_raw["workloads"] == [{"name": "svc-a"}, {"name": "svc-b"}]
+
+    def test_update_preserves_extension_blocks(self, profile_env):
+        mf = DistributionManifest.from_dict({
+            "name": "vendorext2",
+            "version": "0.1.0",
+            "reach": {"tags": ["prod", "eu"]},
+        })
+        staged = _make_staging_dir(profile_env, "vendorext2", manifest=mf)
+        install_distribution(str(staged), name="vendorext2")
+
+        # Author bumps version in staging (still carrying the extension block)
+        mf2 = DistributionManifest.from_dict({
+            "name": "vendorext2",
+            "version": "0.2.0",
+            "reach": {"tags": ["prod", "eu", "us"]},
+        })
+        write_manifest(staged, mf2)
+
+        update_distribution("vendorext2", force_config=False)
+
+        import yaml
+        from hermes_cli.profiles import get_profile_dir
+        installed_raw = yaml.safe_load(
+            (get_profile_dir("vendorext2") / MANIFEST_FILENAME).read_text()
+        )
+        assert installed_raw["reach"] == {"tags": ["prod", "eu", "us"]}
+        assert installed_raw["version"] == "0.2.0"
+
+
 class TestErrorSurfaces:
 
     def test_bad_profile_name_raises_valueerror_not_traceback(self, profile_env, tmp_path):
@@ -675,3 +811,62 @@ class TestErrorSurfaces:
         staged = _make_staging_dir(profile_env, "bad", manifest=mf)
         with pytest.raises((ValueError, DistributionError)):
             plan_install(str(staged), tmp_path / "work")
+
+
+class TestLocalSubdirInstall:
+    """Local-directory sources with the distribution in a subdirectory
+    (issue: subdir distributions — --subdir flag + fragment form)."""
+
+    def _make_repo_with_nested_dist(self, root: Path, subdir: str = "dist/agent") -> Path:
+        repo = root / "monorepo"
+        nested = repo / subdir
+        nested.mkdir(parents=True)
+        (repo / "README.md").write_text("not part of the distribution\n")
+        (nested / "SOUL.md").write_text("nested soul\n")
+        write_manifest(nested, DistributionManifest(name="nested", version="0.1.0"))
+        return repo
+
+    def test_flag_installs_from_subdir(self, profile_env):
+        repo = self._make_repo_with_nested_dist(profile_env)
+        plan = install_distribution(str(repo), subdir="dist/agent")
+        assert (plan.target_dir / "SOUL.md").read_text() == "nested soul\n"
+        # README.md at the repo root is NOT part of the payload
+        assert not (plan.target_dir / "README.md").exists()
+        # Local provenance = the resolved subtree, no fragment - and the
+        # reported subdir is "" to match (source already IS the dist root;
+        # (source, subdir) must compose without double-descent).
+        assert plan.manifest.source == str((repo / "dist/agent").resolve())
+        assert plan.subdir == ""
+
+    def test_fragment_installs_from_subdir_when_literal_path_missing(self, profile_env):
+        repo = self._make_repo_with_nested_dist(profile_env)
+        plan = install_distribution(f"{repo}#subdirectory=dist/agent", name="fragged")
+        assert (plan.target_dir / "SOUL.md").read_text() == "nested soul\n"
+        assert plan.manifest.source == str((repo / "dist/agent").resolve())
+
+    def test_literal_dir_with_hash_in_name_still_wins(self, profile_env):
+        weird = profile_env / "mydir#weird"
+        weird.mkdir()
+        (weird / "SOUL.md").write_text("weird soul\n")
+        write_manifest(weird, DistributionManifest(name="weird", version="0.1.0"))
+        plan = install_distribution(str(weird))
+        assert (plan.target_dir / "SOUL.md").read_text() == "weird soul\n"
+        assert plan.subdir == ""
+
+    def test_subdir_without_manifest_names_exact_path(self, profile_env):
+        repo = self._make_repo_with_nested_dist(profile_env)
+        (repo / "empty").mkdir()
+        with pytest.raises(DistributionError, match=r"empty"):
+            install_distribution(str(repo), name="x", subdir="empty")
+
+    def test_update_round_trips_subtree_provenance(self, profile_env):
+        repo = self._make_repo_with_nested_dist(profile_env)
+        plan = install_distribution(str(repo), subdir="dist/agent")
+        # Bump the nested distribution and update by profile name.
+        nested = repo / "dist/agent"
+        write_manifest(nested, DistributionManifest(name="nested", version="0.2.0"))
+        updated = update_distribution("nested")
+        assert updated.manifest.version == "0.2.0"
+        # Provenance stays the subtree path; update's re-stage saw it as root.
+        assert updated.manifest.source == plan.manifest.source
+        assert updated.subdir == ""

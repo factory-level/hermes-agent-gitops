@@ -71,6 +71,30 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         help="Absolute path for the job to run from. Injects AGENTS.md / CLAUDE.md / .cursorrules from that directory and uses it as the cwd for terminal/file/code_exec tools. Omit to preserve old behaviour (no project context files).",
     )
 
+    # cron sync — converge declarations shipped by a profile distribution
+    cron_sync = cron_subparsers.add_parser(
+        "sync",
+        help="Converge cron declarations shipped in this profile's cron/ directory",
+        description=(
+            "Read every cron/*.{yaml,yml,json} declaration in this profile and "
+            "converge it into the job store. New jobs arrive PAUSED — sync owns "
+            "a job's definition, you own whether it runs, so a resume survives "
+            "later syncs. Jobs whose declaration is gone are removed; jobs you "
+            "created by hand are never touched."
+        ),
+    )
+    cron_sync.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report what would change without writing to the job store",
+    )
+    cron_sync.add_argument(
+        "--json",
+        dest="json_output",
+        action="store_true",
+        help="Emit the change report as JSON on stdout",
+    )
+
     # cron edit
     cron_edit = cron_subparsers.add_parser(
         "edit", help="Edit an existing scheduled job"
@@ -141,6 +165,16 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
 
     cron_resume = cron_subparsers.add_parser("resume", help="Resume a paused job")
     cron_resume.add_argument("job_id", help="Job ID to resume")
+    cron_resume.add_argument(
+        "--until",
+        default=None,
+        help=(
+            "ISO-8601 deadline making this a TEMPORARY enablement: the "
+            "scheduler re-pauses the job once the deadline passes "
+            "(hermes-gitops #476). Omit for a normal resume, which also "
+            "clears any previous deadline."
+        ),
+    )
 
     cron_run = cron_subparsers.add_parser(
         "run", help="Run a job on the next scheduler tick"

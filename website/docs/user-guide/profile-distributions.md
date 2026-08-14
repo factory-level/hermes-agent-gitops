@@ -39,6 +39,13 @@ Recipients run:
 hermes profile install github.com/you/my-research-agent --alias
 ```
 
+**Monorepo layouts.** The distribution doesn't have to sit at the repo
+root: point the install at a subdirectory with `--subdir <path>`, or
+carry it in the source itself — `#subdirectory=<path>`, combinable with
+a ref as `#<ref>&subdirectory=<path>`. `distribution.yaml` must sit at
+that subdirectory's root, and `hermes profile update` follows the
+recorded subdirectory automatically.
+
 …and they now have the whole agent. They fill in their own API keys (`.env.EXAMPLE` → `.env`), and they can run `my-research-agent chat` or address it through Telegram / Discord / Slack / any gateway platform. When you push a new version, they run `hermes profile update my-research-agent` and pull your changes — their memories and sessions stay put.
 
 ## Why git?

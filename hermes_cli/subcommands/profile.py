@@ -150,7 +150,10 @@ def build_profile_parser(subparsers, *, cmd_profile: Callable) -> None:
         description=(
             "Install a Hermes profile distribution. SOURCE can be a git URL "
             "(github.com/user/repo, https://..., git@...) or a local "
-            "directory containing distribution.yaml at its root."
+            "directory containing distribution.yaml at its root. A git "
+            "SOURCE may carry a fragment: '#<ref>' (tag/branch/SHA), "
+            "'#subdirectory=<path>', or '#<ref>&subdirectory=<path>' when "
+            "the distribution lives in a subdirectory of the repo."
         ),
     )
     profile_install.add_argument(
@@ -160,6 +163,13 @@ def build_profile_parser(subparsers, *, cmd_profile: Callable) -> None:
     profile_install.add_argument(
         "--name", dest="install_name", metavar="NAME",
         help="Override profile name (default: read from manifest)",
+    )
+    profile_install.add_argument(
+        "--subdir", dest="install_subdir", metavar="PATH",
+        help=(
+            "Subdirectory of SOURCE containing distribution.yaml "
+            "(same as a '#subdirectory=PATH' source fragment)"
+        ),
     )
     profile_install.add_argument(
         "--alias", action="store_true",
