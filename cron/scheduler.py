@@ -3580,7 +3580,8 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
     # its own sub-chain. Free when HERMES_OBSERVER_URL is unset; a dead
     # observer never touches the run (hermes_lifecycle's contract).
     import hermes_lifecycle as _lc
-    _job_detail = {"job": str(job.get("name") or job.get("id") or "")[:80]}
+    from cron.jobs import lifecycle_job_label
+    _job_detail = {"job": lifecycle_job_label(job)}
     _profile = str(job.get("profile") or "") or None
     _test_run = str(job.get("test_run") or "") or None
     _trig = _lc.emit(

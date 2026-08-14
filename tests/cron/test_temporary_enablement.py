@@ -15,6 +15,7 @@ from cron.jobs import (
     get_job,
     pause_job,
     resume_job,
+    update_job,
 )
 
 
@@ -46,8 +47,11 @@ class TestResumeUntil:
 
 class TestExpiry:
     def test_a_past_deadline_re_pauses_with_a_self_explaining_reason(self):
+        # resume_job now REJECTS a past deadline outright, so simulate the
+        # deadline passing after a valid enablement (the tick's real case).
         job = _make_paused_job()
-        resume_job(job["id"], until=_iso(-5))
+        resume_job(job["id"], until=_iso(30))
+        update_job(job["id"], {"resume_until": _iso(-5)})
         assert expire_temporary_enablements() == 1
         after = get_job(job["id"])
         assert after["enabled"] is False
@@ -69,9 +73,12 @@ class TestExpiry:
         assert get_job(job["id"])["enabled"] is True
 
     def test_a_malformed_deadline_never_pauses_the_job(self):
-        # Fail open on parse: a garbage deadline is visible in `cron list`
-        # and must not silently disable a schedule someone relies on.
+        # resume_job rejects garbage deadlines at the door now, so one can
+        # only exist via a hand-edited store. The expiry pass still fails
+        # open on parse: a garbage deadline is visible in `cron list` and
+        # must not silently disable a schedule someone relies on.
         job = _make_paused_job()
-        resume_job(job["id"], until="not-a-date")
+        resume_job(job["id"], until=_iso(30))
+        update_job(job["id"], {"resume_until": "not-a-date"})
         assert expire_temporary_enablements() == 0
         assert get_job(job["id"])["enabled"] is True

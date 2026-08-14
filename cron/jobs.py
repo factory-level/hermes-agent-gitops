@@ -1184,6 +1184,12 @@ def create_job(
     job = {
         "id": job_id,
         "name": name or label_source[:50].strip(),
+        # Whether the name was authored or derived from prompt/skill/script
+        # text. Lifecycle records only carry AUTHORED names - a derived one
+        # is prompt content, and the record envelope is metadata-only
+        # (hermes-gitops #476; Codex catch: "rotate token sk-live-..." as a
+        # prompt became detail.job verbatim).
+        "name_derived": name is None,
         "prompt": prompt_text,
         "skills": normalized_skills,
         "skill": normalized_skills[0] if normalized_skills else None,
@@ -1391,6 +1397,17 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
     return None
 
 
+def lifecycle_job_label(job: Dict[str, Any]) -> str:
+    """The job handle a lifecycle record may carry: the authored name, or
+    the opaque id. Derived names are prompt/skill/script text and the
+    record envelope is metadata-only, so anything not PROVABLY authored
+    (``name_derived`` is False - jobs predating the flag included) falls
+    back to the id (#476)."""
+    if job.get("name_derived") is False and job.get("name"):
+        return str(job["name"])[:80]
+    return str(job.get("id") or "")[:80]
+
+
 def _lifecycle_emit(type_: str, job: Dict[str, Any]) -> None:
     """One lifecycle record for a registry mutation (#476). Free when the
     observer is unconfigured; never raises into the mutation it narrates."""
@@ -1400,7 +1417,7 @@ def _lifecycle_emit(type_: str, job: Dict[str, Any]) -> None:
         hermes_lifecycle.emit(
             "cron",
             type_,
-            detail={"job": str(job.get("name") or job.get("id") or "")[:80]},
+            detail={"job": lifecycle_job_label(job)},
         )
     except Exception:
         pass
@@ -1437,6 +1454,23 @@ def resume_job(job_id: str, until: Optional[str] = None) -> Optional[Dict[str, A
     job = resolve_job_ref(job_id)
     if not job:
         return None
+
+    # Validate the deadline BEFORE enabling (Codex catch, #476): a
+    # malformed `until` used to store unparseable text that the expiry
+    # pass silently skipped - a "temporary" enablement that never ends.
+    # A deadline already in the past is the same lie one tick earlier.
+    if until is not None:
+        try:
+            until_dt = datetime.fromisoformat(str(until))
+        except ValueError:
+            raise ValueError(
+                f"--until {until!r} is not an ISO-8601 timestamp; the enablement would never expire"
+            )
+        now = _hermes_now()
+        if until_dt.tzinfo is None:
+            until_dt = until_dt.replace(tzinfo=now.tzinfo)
+        if until_dt <= now:
+            raise ValueError(f"--until {until!r} is already in the past")
 
     next_run_at = compute_next_run(job["schedule"])
     if next_run_at is None and job["schedule"].get("kind") == "once":
@@ -1810,6 +1844,32 @@ def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
             if not job.get("enabled", True) or job.get("state") == "paused":
                 return False
             now = _hermes_now()
+            # Temporary-enablement deadline, enforced at the ATOMIC claim
+            # seam (Codex catch, #476): the built-in tick expires these,
+            # but external scheduler providers and the manual cronjob tool
+            # claim directly - without this check an expired job stays
+            # fireable indefinitely once something replaces the ticker.
+            # Fail closed AND record the state change, exactly as the
+            # tick's expiry would.
+            deadline = job.get("resume_until")
+            if deadline:
+                expired = False
+                try:
+                    deadline_dt = datetime.fromisoformat(str(deadline))
+                    if deadline_dt.tzinfo is None:
+                        deadline_dt = deadline_dt.replace(tzinfo=now.tzinfo)
+                    expired = deadline_dt <= now
+                except ValueError:
+                    pass  # malformed: the tick's expiry pass owns that case
+                if expired:
+                    job["enabled"] = False
+                    job["state"] = "paused"
+                    job["paused_at"] = now.isoformat()
+                    job["paused_reason"] = f"temporary enablement expired at {deadline}"
+                    job["resume_until"] = None
+                    save_jobs(jobs)
+                    _lifecycle_emit("cron.disabled", job)
+                    return False
             existing = job.get("fire_claim")
             if existing:
                 try:
